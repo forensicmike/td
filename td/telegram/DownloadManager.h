@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -12,10 +12,9 @@
 #include "td/telegram/td_api.h"
 
 #include "td/actor/actor.h"
-#include "td/actor/PromiseFuture.h"
 
 #include "td/utils/common.h"
-#include "td/utils/Status.h"
+#include "td/utils/Promise.h"
 
 namespace td {
 
@@ -68,13 +67,16 @@ class DownloadManager : public Actor {
                                    bool is_paused, FileCounters counters) = 0;
     virtual void update_file_changed(FileId file_id, int32 complete_date, bool is_paused, FileCounters counters) = 0;
     virtual void update_file_removed(FileId file_id, FileCounters counters) = 0;
-    virtual void start_file(FileId file_id, int8 priority, ActorShared<DownloadManager> download_manager) = 0;
-    virtual void pause_file(FileId file_id) = 0;
+    virtual int64 get_internal_download_id() = 0;
+    virtual void start_file(FileId file_id, int64 internal_download_id, int8 priority,
+                            ActorShared<DownloadManager> download_manager) = 0;
+    virtual void pause_file(FileId file_id, int64 internal_download_id) = 0;
     virtual void delete_file(FileId file_id) = 0;
-    virtual FileId dup_file_id(FileId file_id) = 0;
 
-    virtual FileView get_file_view(FileId file_id) = 0;
+    virtual void get_file_search_text(FileId file_id, FileSourceId file_source_id, Promise<string> &&promise) = 0;
+
     virtual FileView get_sync_file_view(FileId file_id) = 0;
+    virtual td_api::object_ptr<td_api::file> get_file_object(FileId file_id) = 0;
     virtual td_api::object_ptr<td_api::fileDownload> get_file_download_object(FileId file_id,
                                                                               FileSourceId file_source_id,
                                                                               int32 add_date, int32 complete_date,
@@ -86,23 +88,25 @@ class DownloadManager : public Actor {
   //
   // public interface for user
   //
-  virtual void after_get_difference() = 0;
-  virtual Status add_file(FileId file_id, FileSourceId file_source_id, string search_text, int8 priority) = 0;
-  virtual Status change_search_text(FileId file_id, FileSourceId file_source_id, string search_text) = 0;
-  virtual Status toggle_is_paused(FileId file_id, bool is_paused) = 0;
-  virtual Status toggle_all_is_paused(bool is_paused) = 0;
+  virtual void add_file(FileId file_id, FileSourceId file_source_id, string search_text, int8 priority,
+                        Promise<td_api::object_ptr<td_api::file>> promise) = 0;
+  virtual void toggle_is_paused(FileId file_id, bool is_paused, Promise<Unit> promise) = 0;
+  virtual void toggle_all_is_paused(bool is_paused, Promise<Unit> promise) = 0;
   virtual void search(string query, bool only_active, bool only_completed, string offset, int32 limit,
                       Promise<td_api::object_ptr<td_api::foundFileDownloads>> promise) = 0;
-  virtual Status remove_file(FileId file_id, FileSourceId file_source_id, bool delete_from_cache) = 0;
-  virtual Status remove_file_if_finished(FileId file_id) = 0;
-  virtual Status remove_all_files(bool only_active, bool only_completed, bool delete_from_cache) = 0;
+  virtual void remove_file(FileId file_id, FileSourceId file_source_id, bool delete_from_cache,
+                           Promise<Unit> promise) = 0;
+  virtual void remove_all_files(bool only_active, bool only_completed, bool delete_from_cache,
+                                Promise<Unit> promise) = 0;
 
   //
   // private interface to handle all kinds of updates
   //
-  virtual void update_file_download_state(FileId internal_file_id, int64 downloaded_size, int64 size,
-                                          int64 expected_size, bool is_paused) = 0;
-  virtual void update_file_deleted(FileId internal_file_id) = 0;
+  virtual void after_get_difference() = 0;
+  virtual void change_search_text(FileId file_id, FileSourceId file_source_id, string search_text) = 0;
+  virtual void remove_file_if_finished(FileId file_id) = 0;
+  virtual void update_file_download_state(FileId file_id, int64 downloaded_size, int64 size, int64 expected_size,
+                                          bool is_paused) = 0;
   virtual void update_file_viewed(FileId file_id, FileSourceId file_source_id) = 0;
 };
 

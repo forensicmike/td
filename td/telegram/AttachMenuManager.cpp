@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -8,10 +8,12 @@
 
 #include "td/telegram/AccessRights.h"
 #include "td/telegram/AuthManager.h"
-#include "td/telegram/ContactsManager.h"
+#include "td/telegram/ChatManager.h"
 #include "td/telegram/Dependencies.h"
+#include "td/telegram/DialogManager.h"
 #include "td/telegram/Document.h"
 #include "td/telegram/DocumentsManager.h"
+#include "td/telegram/FileReferenceManager.h"
 #include "td/telegram/files/FileId.hpp"
 #include "td/telegram/files/FileManager.h"
 #include "td/telegram/Global.h"
@@ -20,8 +22,11 @@
 #include "td/telegram/StateManager.h"
 #include "td/telegram/Td.h"
 #include "td/telegram/TdDb.h"
-#include "td/telegram/TdParameters.h"
+#include "td/telegram/telegram_api.h"
 #include "td/telegram/ThemeManager.h"
+#include "td/telegram/TopDialogCategory.h"
+#include "td/telegram/UserManager.h"
+#include "td/telegram/WebApp.h"
 
 #include "td/utils/algorithm.h"
 #include "td/utils/buffer.h"
@@ -34,11 +39,176 @@
 
 namespace td {
 
+class GetPopularAppBotsQuery final : public Td::ResultHandler {
+  Promise<td_api::object_ptr<td_api::foundUsers>> promise_;
+
+ public:
+  explicit GetPopularAppBotsQuery(Promise<td_api::object_ptr<td_api::foundUsers>> &&promise)
+      : promise_(std::move(promise)) {
+  }
+
+  void send(const string &offset, int32 limit) {
+    send_query(G()->net_query_creator().create(telegram_api::bots_getPopularAppBots(offset, limit)));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::bots_getPopularAppBots>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for GetPopularAppBotsQuery: " << to_string(ptr);
+
+    vector<int64> user_ids;
+    for (auto &user : ptr->users_) {
+      auto user_id = td_->user_manager_->get_user_id(user);
+      td_->user_manager_->on_get_user(std::move(user), "GetPopularAppBotsQuery");
+      if (td_->user_manager_->is_user_bot(user_id)) {
+        user_ids.push_back(td_->user_manager_->get_user_id_object(user_id, "GetPopularAppBotsQuery"));
+      }
+    }
+    promise_.set_value(td_api::make_object<td_api::foundUsers>(std::move(user_ids), ptr->next_offset_));
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
+  }
+};
+
+class GetBotAppQuery final : public Td::ResultHandler {
+  Promise<telegram_api::object_ptr<telegram_api::messages_botApp>> promise_;
+
+ public:
+  explicit GetBotAppQuery(Promise<telegram_api::object_ptr<telegram_api::messages_botApp>> &&promise)
+      : promise_(std::move(promise)) {
+  }
+
+  void send(telegram_api::object_ptr<telegram_api::InputUser> &&input_user, const string &short_name) {
+    auto input_bot_app =
+        telegram_api::make_object<telegram_api::inputBotAppShortName>(std::move(input_user), short_name);
+    send_query(G()->net_query_creator().create(telegram_api::messages_getBotApp(std::move(input_bot_app), 0)));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_getBotApp>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for GetBotAppQuery: " << to_string(ptr);
+    promise_.set_value(std::move(ptr));
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
+  }
+};
+
+class RequestAppWebViewQuery final : public Td::ResultHandler {
+  Promise<string> promise_;
+
+ public:
+  explicit RequestAppWebViewQuery(Promise<string> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, telegram_api::object_ptr<telegram_api::InputUser> &&input_user,
+            const string &web_app_short_name, const string &start_parameter,
+            const td_api::object_ptr<td_api::themeParameters> &theme, const string &platform, bool allow_write_access) {
+    telegram_api::object_ptr<telegram_api::dataJSON> theme_parameters;
+    int32 flags = 0;
+    if (theme != nullptr) {
+      flags |= telegram_api::messages_requestAppWebView::THEME_PARAMS_MASK;
+
+      theme_parameters = make_tl_object<telegram_api::dataJSON>(string());
+      theme_parameters->data_ = ThemeManager::get_theme_parameters_json_string(theme);
+    }
+    if (allow_write_access) {
+      flags |= telegram_api::messages_requestAppWebView::WRITE_ALLOWED_MASK;
+    }
+    if (!start_parameter.empty()) {
+      flags |= telegram_api::messages_requestAppWebView::START_PARAM_MASK;
+    }
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+    auto input_bot_app =
+        telegram_api::make_object<telegram_api::inputBotAppShortName>(std::move(input_user), web_app_short_name);
+    send_query(G()->net_query_creator().create(telegram_api::messages_requestAppWebView(
+        flags, false /*ignored*/, false /*ignored*/, std::move(input_peer), std::move(input_bot_app), start_parameter,
+        std::move(theme_parameters), platform)));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_requestAppWebView>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for RequestAppWebViewQuery: " << to_string(ptr);
+    LOG_IF(ERROR, ptr->query_id_ != 0) << "Receive " << to_string(ptr);
+    promise_.set_value(std::move(ptr->url_));
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
+  }
+};
+
+class RequestMainWebViewQuery final : public Td::ResultHandler {
+  Promise<td_api::object_ptr<td_api::mainWebApp>> promise_;
+
+ public:
+  explicit RequestMainWebViewQuery(Promise<td_api::object_ptr<td_api::mainWebApp>> &&promise)
+      : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, telegram_api::object_ptr<telegram_api::InputUser> &&input_user,
+            const string &start_parameter, const td_api::object_ptr<td_api::themeParameters> &theme,
+            const string &platform) {
+    telegram_api::object_ptr<telegram_api::dataJSON> theme_parameters;
+    int32 flags = 0;
+    if (theme != nullptr) {
+      flags |= telegram_api::messages_requestMainWebView::THEME_PARAMS_MASK;
+
+      theme_parameters = make_tl_object<telegram_api::dataJSON>(string());
+      theme_parameters->data_ = ThemeManager::get_theme_parameters_json_string(theme);
+    }
+    if (!start_parameter.empty()) {
+      flags |= telegram_api::messages_requestMainWebView::START_PARAM_MASK;
+    }
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+    send_query(G()->net_query_creator().create(telegram_api::messages_requestMainWebView(
+        flags, false /*ignored*/, std::move(input_peer), std::move(input_user), start_parameter,
+        std::move(theme_parameters), platform)));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_requestMainWebView>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for RequestMainWebViewQuery: " << to_string(ptr);
+    LOG_IF(ERROR, ptr->query_id_ != 0) << "Receive " << to_string(ptr);
+    promise_.set_value(td_api::make_object<td_api::mainWebApp>(ptr->url_, !ptr->fullsize_));
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
+  }
+};
+
 class RequestWebViewQuery final : public Td::ResultHandler {
   Promise<td_api::object_ptr<td_api::webAppInfo>> promise_;
   DialogId dialog_id_;
   UserId bot_user_id_;
-  MessageId reply_to_message_id_;
+  MessageId top_thread_message_id_;
+  MessageInputReplyTo input_reply_to_;
+  DialogId as_dialog_id_;
   bool from_attach_menu_ = false;
 
  public:
@@ -47,14 +217,17 @@ class RequestWebViewQuery final : public Td::ResultHandler {
   }
 
   void send(DialogId dialog_id, UserId bot_user_id, tl_object_ptr<telegram_api::InputUser> &&input_user, string &&url,
-            td_api::object_ptr<td_api::themeParameters> &&theme, MessageId reply_to_message_id, bool silent) {
+            td_api::object_ptr<td_api::themeParameters> &&theme, string &&platform, MessageId top_thread_message_id,
+            MessageInputReplyTo input_reply_to, bool silent, DialogId as_dialog_id) {
     dialog_id_ = dialog_id;
     bot_user_id_ = bot_user_id;
-    reply_to_message_id_ = reply_to_message_id;
+    top_thread_message_id_ = top_thread_message_id;
+    input_reply_to_ = std::move(input_reply_to);
+    as_dialog_id_ = as_dialog_id;
 
     int32 flags = 0;
 
-    auto input_peer = td_->messages_manager_->get_input_peer(dialog_id, AccessRights::Write);
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Write);
     CHECK(input_peer != nullptr);
 
     string start_parameter;
@@ -77,22 +250,31 @@ class RequestWebViewQuery final : public Td::ResultHandler {
     tl_object_ptr<telegram_api::dataJSON> theme_parameters;
     if (theme != nullptr) {
       theme_parameters = make_tl_object<telegram_api::dataJSON>(string());
-      theme_parameters->data_ = ThemeManager::get_theme_parameters_json_string(theme, false);
+      theme_parameters->data_ = ThemeManager::get_theme_parameters_json_string(theme);
 
       flags |= telegram_api::messages_requestWebView::THEME_PARAMS_MASK;
     }
 
-    if (reply_to_message_id.is_valid()) {
-      flags |= telegram_api::messages_requestWebView::REPLY_TO_MSG_ID_MASK;
+    auto reply_to = input_reply_to_.get_input_reply_to(td_, top_thread_message_id);
+    if (reply_to != nullptr) {
+      flags |= telegram_api::messages_requestWebView::REPLY_TO_MASK;
     }
 
     if (silent) {
       flags |= telegram_api::messages_requestWebView::SILENT_MASK;
     }
 
+    tl_object_ptr<telegram_api::InputPeer> as_input_peer;
+    if (as_dialog_id.is_valid()) {
+      as_input_peer = td_->dialog_manager_->get_input_peer(as_dialog_id, AccessRights::Write);
+      if (as_input_peer != nullptr) {
+        flags |= telegram_api::messages_requestWebView::SEND_AS_MASK;
+      }
+    }
+
     send_query(G()->net_query_creator().create(telegram_api::messages_requestWebView(
-        flags, false /*ignored*/, false /*ignored*/, std::move(input_peer), std::move(input_user), url, start_parameter,
-        std::move(theme_parameters), reply_to_message_id.get_server_message_id().get())));
+        flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(input_peer), std::move(input_user),
+        url, start_parameter, std::move(theme_parameters), platform, std::move(reply_to), std::move(as_input_peer))));
   }
 
   void on_result(BufferSlice packet) final {
@@ -102,12 +284,14 @@ class RequestWebViewQuery final : public Td::ResultHandler {
     }
 
     auto ptr = result_ptr.move_as_ok();
-    td_->attach_menu_manager_->open_web_view(ptr->query_id_, dialog_id_, bot_user_id_, reply_to_message_id_);
+    LOG_IF(ERROR, (ptr->flags_ & telegram_api::webViewResultUrl::QUERY_ID_MASK) == 0) << "Receive " << to_string(ptr);
+    td_->attach_menu_manager_->open_web_view(ptr->query_id_, dialog_id_, bot_user_id_, top_thread_message_id_,
+                                             std::move(input_reply_to_), as_dialog_id_);
     promise_.set_value(td_api::make_object<td_api::webAppInfo>(ptr->query_id_, ptr->url_));
   }
 
   void on_error(Status status) final {
-    if (!td_->messages_manager_->on_get_dialog_error(dialog_id_, status, "RequestWebViewQuery")) {
+    if (!td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "RequestWebViewQuery")) {
       if (from_attach_menu_) {
         td_->attach_menu_manager_->reload_attach_menu_bots(Promise<Unit>());
       }
@@ -120,26 +304,36 @@ class ProlongWebViewQuery final : public Td::ResultHandler {
   DialogId dialog_id_;
 
  public:
-  void send(DialogId dialog_id, UserId bot_user_id, int64 query_id, MessageId reply_to_message_id, bool silent) {
+  void send(DialogId dialog_id, UserId bot_user_id, int64 query_id, MessageId top_thread_message_id,
+            const MessageInputReplyTo &input_reply_to, bool silent, DialogId as_dialog_id) {
     dialog_id_ = dialog_id;
 
-    auto input_peer = td_->messages_manager_->get_input_peer(dialog_id, AccessRights::Write);
-    auto r_input_user = td_->contacts_manager_->get_input_user(bot_user_id);
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Write);
+    auto r_input_user = td_->user_manager_->get_input_user(bot_user_id);
     if (input_peer == nullptr || r_input_user.is_error()) {
       return;
     }
 
     int32 flags = 0;
-    if (reply_to_message_id.is_valid()) {
-      flags |= telegram_api::messages_prolongWebView::REPLY_TO_MSG_ID_MASK;
+    auto reply_to = input_reply_to.get_input_reply_to(td_, top_thread_message_id);
+    if (reply_to != nullptr) {
+      flags |= telegram_api::messages_prolongWebView::REPLY_TO_MASK;
     }
     if (silent) {
       flags |= telegram_api::messages_prolongWebView::SILENT_MASK;
     }
 
+    tl_object_ptr<telegram_api::InputPeer> as_input_peer;
+    if (as_dialog_id.is_valid()) {
+      as_input_peer = td_->dialog_manager_->get_input_peer(as_dialog_id, AccessRights::Write);
+      if (as_input_peer != nullptr) {
+        flags |= telegram_api::messages_prolongWebView::SEND_AS_MASK;
+      }
+    }
+
     send_query(G()->net_query_creator().create(telegram_api::messages_prolongWebView(
-        flags, false /*ignored*/, std::move(input_peer), r_input_user.move_as_ok(), query_id,
-        reply_to_message_id.get_server_message_id().get())));
+        flags, false /*ignored*/, std::move(input_peer), r_input_user.move_as_ok(), query_id, std::move(reply_to),
+        std::move(as_input_peer))));
   }
 
   void on_result(BufferSlice packet) final {
@@ -155,7 +349,39 @@ class ProlongWebViewQuery final : public Td::ResultHandler {
   }
 
   void on_error(Status status) final {
-    td_->messages_manager_->on_get_dialog_error(dialog_id_, status, "ProlongWebViewQuery");
+    td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "ProlongWebViewQuery");
+  }
+};
+
+class InvokeWebViewCustomMethodQuery final : public Td::ResultHandler {
+  Promise<td_api::object_ptr<td_api::customRequestResult>> promise_;
+
+ public:
+  explicit InvokeWebViewCustomMethodQuery(Promise<td_api::object_ptr<td_api::customRequestResult>> &&promise)
+      : promise_(std::move(promise)) {
+  }
+
+  void send(UserId bot_user_id, const string &method, const string &parameters) {
+    auto r_input_user = td_->user_manager_->get_input_user(bot_user_id);
+    if (r_input_user.is_error()) {
+      return on_error(r_input_user.move_as_error());
+    }
+    send_query(G()->net_query_creator().create(telegram_api::bots_invokeWebViewCustomMethod(
+        r_input_user.move_as_ok(), method, make_tl_object<telegram_api::dataJSON>(parameters))));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::bots_invokeWebViewCustomMethod>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto result = result_ptr.move_as_ok();
+    promise_.set_value(td_api::make_object<td_api::customRequestResult>(result->data_));
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
   }
 };
 
@@ -179,7 +405,6 @@ class GetAttachMenuBotsQuery final : public Td::ResultHandler {
 
     auto ptr = result_ptr.move_as_ok();
     LOG(INFO) << "Receive result for GetAttachMenuBotsQuery: " << to_string(ptr);
-
     promise_.set_value(std::move(ptr));
   }
 
@@ -223,9 +448,13 @@ class ToggleBotInAttachMenuQuery final : public Td::ResultHandler {
   explicit ToggleBotInAttachMenuQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
   }
 
-  void send(tl_object_ptr<telegram_api::InputUser> &&input_user, bool is_added) {
-    send_query(
-        G()->net_query_creator().create(telegram_api::messages_toggleBotInAttachMenu(std::move(input_user), is_added)));
+  void send(tl_object_ptr<telegram_api::InputUser> &&input_user, bool is_added, bool allow_write_access) {
+    int32 flags = 0;
+    if (is_added && allow_write_access) {
+      flags |= telegram_api::messages_toggleBotInAttachMenu::WRITE_ALLOWED_MASK;
+    }
+    send_query(G()->net_query_creator().create(
+        telegram_api::messages_toggleBotInAttachMenu(flags, false /*ignored*/, std::move(input_user), is_added)));
   }
 
   void on_result(BufferSlice packet) final {
@@ -268,12 +497,23 @@ void AttachMenuManager::AttachMenuBotColor::parse(ParserT &parser) {
 }
 
 bool operator==(const AttachMenuManager::AttachMenuBot &lhs, const AttachMenuManager::AttachMenuBot &rhs) {
-  return lhs.user_id_ == rhs.user_id_ && lhs.name_ == rhs.name_ &&
+  return lhs.user_id_ == rhs.user_id_ && lhs.supports_self_dialog_ == rhs.supports_self_dialog_ &&
+         lhs.supports_user_dialogs_ == rhs.supports_user_dialogs_ &&
+         lhs.supports_bot_dialogs_ == rhs.supports_bot_dialogs_ &&
+         lhs.supports_group_dialogs_ == rhs.supports_group_dialogs_ &&
+         lhs.supports_broadcast_dialogs_ == rhs.supports_broadcast_dialogs_ &&
+         lhs.request_write_access_ == rhs.request_write_access_ &&
+         lhs.show_in_attach_menu_ == rhs.show_in_attach_menu_ && lhs.show_in_side_menu_ == rhs.show_in_side_menu_ &&
+         lhs.side_menu_disclaimer_needed_ == rhs.side_menu_disclaimer_needed_ && lhs.name_ == rhs.name_ &&
          lhs.default_icon_file_id_ == rhs.default_icon_file_id_ &&
          lhs.ios_static_icon_file_id_ == rhs.ios_static_icon_file_id_ &&
          lhs.ios_animated_icon_file_id_ == rhs.ios_animated_icon_file_id_ &&
          lhs.android_icon_file_id_ == rhs.android_icon_file_id_ && lhs.macos_icon_file_id_ == rhs.macos_icon_file_id_ &&
-         lhs.is_added_ == rhs.is_added_ && lhs.name_color_ == rhs.name_color_ && lhs.icon_color_ == rhs.icon_color_;
+         lhs.android_side_menu_icon_file_id_ == rhs.android_side_menu_icon_file_id_ &&
+         lhs.ios_side_menu_icon_file_id_ == rhs.ios_side_menu_icon_file_id_ &&
+         lhs.macos_side_menu_icon_file_id_ == rhs.macos_side_menu_icon_file_id_ && lhs.is_added_ == rhs.is_added_ &&
+         lhs.name_color_ == rhs.name_color_ && lhs.icon_color_ == rhs.icon_color_ &&
+         lhs.placeholder_file_id_ == rhs.placeholder_file_id_;
 }
 
 bool operator!=(const AttachMenuManager::AttachMenuBot &lhs, const AttachMenuManager::AttachMenuBot &rhs) {
@@ -288,6 +528,12 @@ void AttachMenuManager::AttachMenuBot::store(StorerT &storer) const {
   bool has_macos_icon_file_id = macos_icon_file_id_.is_valid();
   bool has_name_color = name_color_ != AttachMenuBotColor();
   bool has_icon_color = icon_color_ != AttachMenuBotColor();
+  bool has_support_flags = true;
+  bool has_placeholder_file_id = placeholder_file_id_.is_valid();
+  bool has_cache_version = cache_version_ != 0;
+  bool has_android_side_menu_icon_file_id = android_side_menu_icon_file_id_.is_valid();
+  bool has_ios_side_menu_icon_file_id = ios_side_menu_icon_file_id_.is_valid();
+  bool has_macos_side_menu_icon_file_id = macos_side_menu_icon_file_id_.is_valid();
   BEGIN_STORE_FLAGS();
   STORE_FLAG(has_ios_static_icon_file_id);
   STORE_FLAG(has_ios_animated_icon_file_id);
@@ -296,6 +542,22 @@ void AttachMenuManager::AttachMenuBot::store(StorerT &storer) const {
   STORE_FLAG(is_added_);
   STORE_FLAG(has_name_color);
   STORE_FLAG(has_icon_color);
+  STORE_FLAG(has_support_flags);
+  STORE_FLAG(supports_self_dialog_);
+  STORE_FLAG(supports_user_dialogs_);
+  STORE_FLAG(supports_bot_dialogs_);
+  STORE_FLAG(supports_group_dialogs_);
+  STORE_FLAG(supports_broadcast_dialogs_);
+  STORE_FLAG(false);
+  STORE_FLAG(has_placeholder_file_id);
+  STORE_FLAG(has_cache_version);
+  STORE_FLAG(request_write_access_);
+  STORE_FLAG(show_in_attach_menu_);
+  STORE_FLAG(show_in_side_menu_);
+  STORE_FLAG(side_menu_disclaimer_needed_);
+  STORE_FLAG(has_android_side_menu_icon_file_id);
+  STORE_FLAG(has_ios_side_menu_icon_file_id);
+  STORE_FLAG(has_macos_side_menu_icon_file_id);
   END_STORE_FLAGS();
   td::store(user_id_, storer);
   td::store(name_, storer);
@@ -318,6 +580,21 @@ void AttachMenuManager::AttachMenuBot::store(StorerT &storer) const {
   if (has_icon_color) {
     td::store(icon_color_, storer);
   }
+  if (has_placeholder_file_id) {
+    td::store(placeholder_file_id_, storer);
+  }
+  if (has_cache_version) {
+    td::store(cache_version_, storer);
+  }
+  if (has_android_side_menu_icon_file_id) {
+    td::store(android_side_menu_icon_file_id_, storer);
+  }
+  if (has_ios_side_menu_icon_file_id) {
+    td::store(ios_side_menu_icon_file_id_, storer);
+  }
+  if (has_macos_side_menu_icon_file_id) {
+    td::store(macos_side_menu_icon_file_id_, storer);
+  }
 }
 
 template <class ParserT>
@@ -328,6 +605,13 @@ void AttachMenuManager::AttachMenuBot::parse(ParserT &parser) {
   bool has_macos_icon_file_id;
   bool has_name_color;
   bool has_icon_color;
+  bool has_support_flags;
+  bool has_placeholder_file_id;
+  bool has_cache_version;
+  bool has_android_side_menu_icon_file_id;
+  bool has_ios_side_menu_icon_file_id;
+  bool has_macos_side_menu_icon_file_id;
+  bool legacy_supports_settings;
   BEGIN_PARSE_FLAGS();
   PARSE_FLAG(has_ios_static_icon_file_id);
   PARSE_FLAG(has_ios_animated_icon_file_id);
@@ -336,6 +620,22 @@ void AttachMenuManager::AttachMenuBot::parse(ParserT &parser) {
   PARSE_FLAG(is_added_);
   PARSE_FLAG(has_name_color);
   PARSE_FLAG(has_icon_color);
+  PARSE_FLAG(has_support_flags);
+  PARSE_FLAG(supports_self_dialog_);
+  PARSE_FLAG(supports_user_dialogs_);
+  PARSE_FLAG(supports_bot_dialogs_);
+  PARSE_FLAG(supports_group_dialogs_);
+  PARSE_FLAG(supports_broadcast_dialogs_);
+  PARSE_FLAG(legacy_supports_settings);
+  PARSE_FLAG(has_placeholder_file_id);
+  PARSE_FLAG(has_cache_version);
+  PARSE_FLAG(request_write_access_);
+  PARSE_FLAG(show_in_attach_menu_);
+  PARSE_FLAG(show_in_side_menu_);
+  PARSE_FLAG(side_menu_disclaimer_needed_);
+  PARSE_FLAG(has_android_side_menu_icon_file_id);
+  PARSE_FLAG(has_ios_side_menu_icon_file_id);
+  PARSE_FLAG(has_macos_side_menu_icon_file_id);
   END_PARSE_FLAGS();
   td::parse(user_id_, parser);
   td::parse(name_, parser);
@@ -357,6 +657,31 @@ void AttachMenuManager::AttachMenuBot::parse(ParserT &parser) {
   }
   if (has_icon_color) {
     td::parse(icon_color_, parser);
+  }
+  if (has_placeholder_file_id) {
+    td::parse(placeholder_file_id_, parser);
+  }
+  if (has_cache_version) {
+    td::parse(cache_version_, parser);
+  }
+  if (has_android_side_menu_icon_file_id) {
+    td::parse(android_side_menu_icon_file_id_, parser);
+  }
+  if (has_ios_side_menu_icon_file_id) {
+    td::parse(ios_side_menu_icon_file_id_, parser);
+  }
+  if (has_macos_side_menu_icon_file_id) {
+    td::parse(macos_side_menu_icon_file_id_, parser);
+  }
+
+  if (!has_support_flags) {
+    supports_self_dialog_ = true;
+    supports_user_dialogs_ = true;
+    supports_bot_dialogs_ = true;
+  }
+  if (is_added_ && !show_in_attach_menu_ && !show_in_side_menu_ && !has_android_side_menu_icon_file_id &&
+      !has_ios_side_menu_icon_file_id && !has_macos_side_menu_icon_file_id) {
+    show_in_attach_menu_ = true;
   }
 }
 
@@ -404,7 +729,7 @@ void AttachMenuManager::init() {
   }
   is_inited_ = true;
 
-  if (!G()->parameters().use_chat_info_db) {
+  if (!G()->use_chat_info_database()) {
     G()->td_db()->get_binlog_pmc()->erase(get_attach_menu_bots_database_key());
   } else {
     auto attach_menu_bots_string = G()->td_db()->get_binlog_pmc()->get(get_attach_menu_bots_database_key());
@@ -425,8 +750,32 @@ void AttachMenuManager::init() {
         dependencies.add(attach_menu_bot.user_id_);
       }
       if (is_valid && dependencies.resolve_force(td_, "AttachMenuBotsLogEvent")) {
-        hash_ = attach_menu_bots_log_event.hash_;
+        bool is_cache_outdated = false;
+        for (auto &bot : attach_menu_bots_log_event.attach_menu_bots_) {
+          if (bot.cache_version_ != AttachMenuBot::CACHE_VERSION) {
+            is_cache_outdated = true;
+          }
+        }
+        hash_ = is_cache_outdated ? 0 : attach_menu_bots_log_event.hash_;
         attach_menu_bots_ = std::move(attach_menu_bots_log_event.attach_menu_bots_);
+
+        for (auto attach_menu_bot : attach_menu_bots_) {
+          auto file_source_id = get_attach_menu_bot_file_source_id(attach_menu_bot.user_id_);
+          auto register_file_source = [&](FileId file_id) {
+            if (file_id.is_valid()) {
+              td_->file_manager_->add_file_source(file_id, file_source_id, "attach_menu_bot");
+            }
+          };
+          register_file_source(attach_menu_bot.default_icon_file_id_);
+          register_file_source(attach_menu_bot.ios_static_icon_file_id_);
+          register_file_source(attach_menu_bot.ios_animated_icon_file_id_);
+          register_file_source(attach_menu_bot.android_icon_file_id_);
+          register_file_source(attach_menu_bot.macos_icon_file_id_);
+          register_file_source(attach_menu_bot.placeholder_file_id_);
+          register_file_source(attach_menu_bot.android_side_menu_icon_file_id_);
+          register_file_source(attach_menu_bot.ios_side_menu_icon_file_id_);
+          register_file_source(attach_menu_bot.macos_side_menu_icon_file_id_);
+        }
       } else {
         LOG(ERROR) << "Ignore invalid attachment menu bots log event";
       }
@@ -492,8 +841,9 @@ void AttachMenuManager::ping_web_view() {
   for (const auto &it : opened_web_views_) {
     const auto &opened_web_view = it.second;
     bool silent = td_->messages_manager_->get_dialog_silent_send_message(opened_web_view.dialog_id_);
-    td_->create_handler<ProlongWebViewQuery>()->send(opened_web_view.dialog_id_, opened_web_view.bot_user_id_, it.first,
-                                                     opened_web_view.reply_to_message_id_, silent);
+    td_->create_handler<ProlongWebViewQuery>()->send(
+        opened_web_view.dialog_id_, opened_web_view.bot_user_id_, it.first, opened_web_view.top_thread_message_id_,
+        opened_web_view.input_reply_to_, silent, opened_web_view.as_dialog_id_);
   }
 
   schedule_ping_web_view();
@@ -505,49 +855,131 @@ void AttachMenuManager::schedule_ping_web_view() {
   ping_web_view_timeout_.set_timeout_in(PING_WEB_VIEW_TIMEOUT);
 }
 
-void AttachMenuManager::request_web_view(DialogId dialog_id, UserId bot_user_id, MessageId reply_to_message_id,
-                                         string &&url, td_api::object_ptr<td_api::themeParameters> &&theme,
+void AttachMenuManager::get_popular_app_bots(const string &offset, int32 limit,
+                                             Promise<td_api::object_ptr<td_api::foundUsers>> &&promise) {
+  if (limit <= 0) {
+    return promise.set_error(Status::Error(400, "Limit must be positive"));
+  }
+  td_->create_handler<GetPopularAppBotsQuery>(std::move(promise))->send(offset, limit);
+}
+
+void AttachMenuManager::get_web_app(UserId bot_user_id, const string &web_app_short_name,
+                                    Promise<td_api::object_ptr<td_api::foundWebApp>> &&promise) {
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(bot_user_id));
+  TRY_RESULT_PROMISE(promise, bot_data, td_->user_manager_->get_bot_data(bot_user_id));
+  auto query_promise =
+      PromiseCreator::lambda([actor_id = actor_id(this), bot_user_id, web_app_short_name, promise = std::move(promise)](
+                                 Result<telegram_api::object_ptr<telegram_api::messages_botApp>> result) mutable {
+        send_closure(actor_id, &AttachMenuManager::on_get_web_app, bot_user_id, std::move(web_app_short_name),
+                     std::move(result), std::move(promise));
+      });
+  td_->create_handler<GetBotAppQuery>(std::move(query_promise))->send(std::move(input_user), web_app_short_name);
+}
+
+void AttachMenuManager::on_get_web_app(UserId bot_user_id, string web_app_short_name,
+                                       Result<telegram_api::object_ptr<telegram_api::messages_botApp>> result,
+                                       Promise<td_api::object_ptr<td_api::foundWebApp>> promise) {
+  G()->ignore_result_if_closing(result);
+  if (result.is_error() && result.error().message() == "BOT_APP_INVALID") {
+    return promise.set_value(nullptr);
+  }
+  TRY_RESULT_PROMISE(promise, bot_app, std::move(result));
+  if (bot_app->app_->get_id() != telegram_api::botApp::ID) {
+    CHECK(bot_app->app_->get_id() != telegram_api::botAppNotModified::ID);
+    LOG(ERROR) << "Receive " << to_string(bot_app);
+    return promise.set_error(Status::Error(500, "Receive invalid response"));
+  }
+
+  WebApp web_app(td_, telegram_api::move_object_as<telegram_api::botApp>(bot_app->app_), DialogId(bot_user_id));
+  auto file_ids = web_app.get_file_ids(td_);
+  if (!file_ids.empty()) {
+    auto file_source_id = get_web_app_file_source_id(bot_user_id, web_app_short_name);
+    for (auto file_id : file_ids) {
+      td_->file_manager_->add_file_source(file_id, file_source_id, "on_get_web_app");
+    }
+  }
+  promise.set_value(td_api::make_object<td_api::foundWebApp>(web_app.get_web_app_object(td_),
+                                                             bot_app->request_write_access_, !bot_app->inactive_));
+}
+
+void AttachMenuManager::reload_web_app(UserId bot_user_id, const string &web_app_short_name, Promise<Unit> &&promise) {
+  get_web_app(bot_user_id, web_app_short_name,
+              PromiseCreator::lambda(
+                  [promise = std::move(promise)](Result<td_api::object_ptr<td_api::foundWebApp>> result) mutable {
+                    if (result.is_error()) {
+                      promise.set_error(result.move_as_error());
+                    } else {
+                      promise.set_value(Unit());
+                    }
+                  }));
+}
+
+void AttachMenuManager::request_app_web_view(DialogId dialog_id, UserId bot_user_id, string &&web_app_short_name,
+                                             string &&start_parameter,
+                                             const td_api::object_ptr<td_api::themeParameters> &theme,
+                                             string &&platform, bool allow_write_access, Promise<string> &&promise) {
+  if (!td_->dialog_manager_->have_input_peer(dialog_id, false, AccessRights::Read)) {
+    dialog_id = DialogId(bot_user_id);
+  }
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(bot_user_id));
+  TRY_RESULT_PROMISE(promise, bot_data, td_->user_manager_->get_bot_data(bot_user_id));
+  on_dialog_used(TopDialogCategory::BotApp, DialogId(bot_user_id), G()->unix_time());
+
+  td_->create_handler<RequestAppWebViewQuery>(std::move(promise))
+      ->send(dialog_id, std::move(input_user), web_app_short_name, start_parameter, theme, platform,
+             allow_write_access);
+}
+
+void AttachMenuManager::request_main_web_view(DialogId dialog_id, UserId bot_user_id, string &&start_parameter,
+                                              const td_api::object_ptr<td_api::themeParameters> &theme,
+                                              string &&platform,
+                                              Promise<td_api::object_ptr<td_api::mainWebApp>> &&promise) {
+  if (!td_->dialog_manager_->have_input_peer(dialog_id, false, AccessRights::Read)) {
+    dialog_id = DialogId(bot_user_id);
+  }
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(bot_user_id));
+  TRY_RESULT_PROMISE(promise, bot_data, td_->user_manager_->get_bot_data(bot_user_id));
+  if (!bot_data.has_main_app) {
+    return promise.set_error(Status::Error(400, "The bot has no main Mini App"));
+  }
+  on_dialog_used(TopDialogCategory::BotApp, DialogId(bot_user_id), G()->unix_time());
+
+  td_->create_handler<RequestMainWebViewQuery>(std::move(promise))
+      ->send(dialog_id, std::move(input_user), start_parameter, theme, platform);
+}
+
+void AttachMenuManager::request_web_view(DialogId dialog_id, UserId bot_user_id, MessageId top_thread_message_id,
+                                         td_api::object_ptr<td_api::InputMessageReplyTo> &&reply_to, string &&url,
+                                         td_api::object_ptr<td_api::themeParameters> &&theme, string &&platform,
                                          Promise<td_api::object_ptr<td_api::webAppInfo>> &&promise) {
-  TRY_STATUS_PROMISE(promise, td_->contacts_manager_->get_bot_data(bot_user_id));
-  TRY_RESULT_PROMISE(promise, input_user, td_->contacts_manager_->get_input_user(bot_user_id));
+  TRY_STATUS_PROMISE(promise, td_->user_manager_->get_bot_data(bot_user_id));
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(bot_user_id));
+  TRY_RESULT_PROMISE(promise, bot_data, td_->user_manager_->get_bot_data(bot_user_id));
+  TRY_STATUS_PROMISE(
+      promise, td_->dialog_manager_->check_dialog_access(dialog_id, false, AccessRights::Write, "request_web_view"));
+  on_dialog_used(TopDialogCategory::BotApp, DialogId(bot_user_id), G()->unix_time());
 
-  if (!td_->messages_manager_->have_dialog_force(dialog_id, "request_web_view")) {
-    return promise.set_error(Status::Error(400, "Chat not found"));
+  if (!top_thread_message_id.is_valid() || !top_thread_message_id.is_server() ||
+      dialog_id.get_type() != DialogType::Channel ||
+      !td_->chat_manager_->is_megagroup_channel(dialog_id.get_channel_id())) {
+    top_thread_message_id = MessageId();
   }
-
-  switch (dialog_id.get_type()) {
-    case DialogType::User:
-      // ok
-      break;
-    case DialogType::Chat:
-    case DialogType::Channel:
-    case DialogType::SecretChat:
-      return promise.set_error(Status::Error(400, "Web apps can be opened only in private chats"));
-    case DialogType::None:
-    default:
-      UNREACHABLE();
-  }
-
-  if (!td_->messages_manager_->have_input_peer(dialog_id, AccessRights::Write)) {
-    return promise.set_error(Status::Error(400, "Have no write access to the chat"));
-  }
-
-  if (!reply_to_message_id.is_valid() || !reply_to_message_id.is_server() ||
-      !td_->messages_manager_->have_message_force({dialog_id, reply_to_message_id}, "request_web_view")) {
-    reply_to_message_id = MessageId();
-  }
+  auto input_reply_to = td_->messages_manager_->create_message_input_reply_to(dialog_id, top_thread_message_id,
+                                                                              std::move(reply_to), false);
 
   bool silent = td_->messages_manager_->get_dialog_silent_send_message(dialog_id);
+  DialogId as_dialog_id = td_->messages_manager_->get_dialog_default_send_message_as_dialog_id(dialog_id);
 
   td_->create_handler<RequestWebViewQuery>(std::move(promise))
-      ->send(dialog_id, bot_user_id, std::move(input_user), std::move(url), std::move(theme), reply_to_message_id,
-             silent);
+      ->send(dialog_id, bot_user_id, std::move(input_user), std::move(url), std::move(theme), std::move(platform),
+             top_thread_message_id, std::move(input_reply_to), silent, as_dialog_id);
 }
 
 void AttachMenuManager::open_web_view(int64 query_id, DialogId dialog_id, UserId bot_user_id,
-                                      MessageId reply_to_message_id) {
+                                      MessageId top_thread_message_id, MessageInputReplyTo &&input_reply_to,
+                                      DialogId as_dialog_id) {
   if (query_id == 0) {
-    LOG(ERROR) << "Receive web app query identifier == 0";
+    LOG(ERROR) << "Receive Web App query identifier == 0";
     return;
   }
 
@@ -557,7 +989,9 @@ void AttachMenuManager::open_web_view(int64 query_id, DialogId dialog_id, UserId
   OpenedWebView opened_web_view;
   opened_web_view.dialog_id_ = dialog_id;
   opened_web_view.bot_user_id_ = bot_user_id;
-  opened_web_view.reply_to_message_id_ = reply_to_message_id;
+  opened_web_view.top_thread_message_id_ = top_thread_message_id;
+  opened_web_view.input_reply_to_ = std::move(input_reply_to);
+  opened_web_view.as_dialog_id_ = as_dialog_id;
   opened_web_views_.emplace(query_id, std::move(opened_web_view));
 }
 
@@ -569,12 +1003,20 @@ void AttachMenuManager::close_web_view(int64 query_id, Promise<Unit> &&promise) 
   promise.set_value(Unit());
 }
 
+void AttachMenuManager::invoke_web_view_custom_method(
+    UserId bot_user_id, const string &method, const string &parameters,
+    Promise<td_api::object_ptr<td_api::customRequestResult>> &&promise) {
+  td_->create_handler<InvokeWebViewCustomMethodQuery>(std::move(promise))->send(bot_user_id, method, parameters);
+}
+
 Result<AttachMenuManager::AttachMenuBot> AttachMenuManager::get_attach_menu_bot(
-    tl_object_ptr<telegram_api::attachMenuBot> &&bot) const {
+    tl_object_ptr<telegram_api::attachMenuBot> &&bot) {
   UserId user_id(bot->bot_id_);
-  if (!td_->contacts_manager_->have_user(user_id)) {
+  if (!td_->user_manager_->have_user(user_id)) {
     return Status::Error(PSLICE() << "Have no information about " << user_id);
   }
+
+  auto file_source_id = get_attach_menu_bot_file_source_id(user_id);
 
   AttachMenuBot attach_menu_bot;
   attach_menu_bot.is_added_ = !bot->inactive_;
@@ -589,7 +1031,8 @@ Result<AttachMenuManager::AttachMenuBot> AttachMenuManager::get_attach_menu_bot(
     CHECK(document_id == telegram_api::document::ID);
 
     if (name != "default_static" && name != "ios_static" && name != "ios_animated" && name != "android_animated" &&
-        name != "macos_animated") {
+        name != "macos_animated" && name != "placeholder_static" && name != "ios_side_menu_static" &&
+        name != "android_side_menu_static" && name != "macos_side_menu_static") {
       LOG(ERROR) << "Have icon for " << user_id << " with name " << name;
       continue;
     }
@@ -598,9 +1041,7 @@ Result<AttachMenuManager::AttachMenuBot> AttachMenuManager::get_attach_menu_bot(
     auto parsed_document =
         td_->documents_manager_->on_get_document(move_tl_object_as<telegram_api::document>(icon->icon_), DialogId());
     if (parsed_document.type != expected_document_type) {
-      if (user_id != UserId(static_cast<int64>(5000860301)) || !G()->is_test_dc() || name != "macos_animated") {
-        LOG(ERROR) << "Receive wrong attachment menu bot icon \"" << name << "\" for " << user_id;
-      }
+      LOG(ERROR) << "Receive wrong attachment menu bot icon \"" << name << "\" for " << user_id;
       continue;
     }
     bool expect_colors = false;
@@ -615,15 +1056,29 @@ Result<AttachMenuManager::AttachMenuBot> AttachMenuManager::get_attach_menu_bot(
         attach_menu_bot.ios_animated_icon_file_id_ = parsed_document.file_id;
         break;
       case 'i':
-        attach_menu_bot.android_icon_file_id_ = parsed_document.file_id;
-        expect_colors = true;
+        if (name[8] == 's') {
+          attach_menu_bot.android_side_menu_icon_file_id_ = parsed_document.file_id;
+        } else if (name[8] == '_') {
+          attach_menu_bot.ios_side_menu_icon_file_id_ = parsed_document.file_id;
+        } else {
+          attach_menu_bot.android_icon_file_id_ = parsed_document.file_id;
+          expect_colors = true;
+        }
         break;
       case '_':
-        attach_menu_bot.macos_icon_file_id_ = parsed_document.file_id;
+        if (name[6] == 's') {
+          attach_menu_bot.macos_side_menu_icon_file_id_ = parsed_document.file_id;
+        } else {
+          attach_menu_bot.macos_icon_file_id_ = parsed_document.file_id;
+        }
+        break;
+      case 'h':
+        attach_menu_bot.placeholder_file_id_ = parsed_document.file_id;
         break;
       default:
         UNREACHABLE();
     }
+    td_->file_manager_->add_file_source(parsed_document.file_id, file_source_id, "get_attach_menu_bot");
     if (expect_colors) {
       if (icon->colors_.empty()) {
         LOG(ERROR) << "Have no colors for attachment menu bot icon for " << user_id;
@@ -671,34 +1126,63 @@ Result<AttachMenuManager::AttachMenuBot> AttachMenuManager::get_attach_menu_bot(
       }
     }
   }
-
+  for (auto &peer_type : bot->peer_types_) {
+    switch (peer_type->get_id()) {
+      case telegram_api::attachMenuPeerTypeSameBotPM::ID:
+        attach_menu_bot.supports_self_dialog_ = true;
+        break;
+      case telegram_api::attachMenuPeerTypeBotPM::ID:
+        attach_menu_bot.supports_bot_dialogs_ = true;
+        break;
+      case telegram_api::attachMenuPeerTypePM::ID:
+        attach_menu_bot.supports_user_dialogs_ = true;
+        break;
+      case telegram_api::attachMenuPeerTypeChat::ID:
+        attach_menu_bot.supports_group_dialogs_ = true;
+        break;
+      case telegram_api::attachMenuPeerTypeBroadcast::ID:
+        attach_menu_bot.supports_broadcast_dialogs_ = true;
+        break;
+      default:
+        UNREACHABLE();
+        break;
+    }
+  }
+  attach_menu_bot.request_write_access_ = bot->request_write_access_;
+  attach_menu_bot.show_in_attach_menu_ = bot->show_in_attach_menu_;
+  attach_menu_bot.show_in_side_menu_ = bot->show_in_side_menu_;
+  attach_menu_bot.side_menu_disclaimer_needed_ = bot->side_menu_disclaimer_needed_;
   if (!attach_menu_bot.default_icon_file_id_.is_valid()) {
     return Status::Error(PSLICE() << "Have no default icon for " << user_id);
   }
+  attach_menu_bot.cache_version_ = AttachMenuBot::CACHE_VERSION;
 
   return std::move(attach_menu_bot);
 }
 
 void AttachMenuManager::reload_attach_menu_bots(Promise<Unit> &&promise) {
   if (!is_active()) {
-    return;
+    return promise.set_error(Status::Error(400, "Can't reload attachment menu bots"));
   }
-  auto query_promise =
-      PromiseCreator::lambda([actor_id = actor_id(this), promise = std::move(promise)](
-                                 Result<telegram_api::object_ptr<telegram_api::AttachMenuBots>> &&result) mutable {
-        send_closure(actor_id, &AttachMenuManager::on_reload_attach_menu_bots, std::move(result), std::move(promise));
-      });
-  td_->create_handler<GetAttachMenuBotsQuery>(std::move(query_promise))->send(hash_);
+
+  reload_attach_menu_bots_queries_.push_back(std::move(promise));
+  if (reload_attach_menu_bots_queries_.size() == 1) {
+    auto query_promise = PromiseCreator::lambda(
+        [actor_id = actor_id(this)](Result<telegram_api::object_ptr<telegram_api::AttachMenuBots>> &&result) {
+          send_closure(actor_id, &AttachMenuManager::on_reload_attach_menu_bots, std::move(result));
+        });
+    td_->create_handler<GetAttachMenuBotsQuery>(std::move(query_promise))->send(hash_);
+  }
 }
 
 void AttachMenuManager::on_reload_attach_menu_bots(
-    Result<telegram_api::object_ptr<telegram_api::AttachMenuBots>> &&result, Promise<Unit> &&promise) {
+    Result<telegram_api::object_ptr<telegram_api::AttachMenuBots>> &&result) {
   if (!is_active()) {
-    return promise.set_value(Unit());
+    return set_promises(reload_attach_menu_bots_queries_);
   }
   if (result.is_error()) {
     set_timeout_in(Random::fast(60, 120));
-    return promise.set_value(Unit());
+    return set_promises(reload_attach_menu_bots_queries_);
   }
 
   is_inited_ = true;
@@ -708,12 +1192,12 @@ void AttachMenuManager::on_reload_attach_menu_bots(
   auto attach_menu_bots_ptr = result.move_as_ok();
   auto constructor_id = attach_menu_bots_ptr->get_id();
   if (constructor_id == telegram_api::attachMenuBotsNotModified::ID) {
-    return promise.set_value(Unit());
+    return set_promises(reload_attach_menu_bots_queries_);
   }
   CHECK(constructor_id == telegram_api::attachMenuBots::ID);
   auto attach_menu_bots = move_tl_object_as<telegram_api::attachMenuBots>(attach_menu_bots_ptr);
 
-  td_->contacts_manager_->on_get_users(std::move(attach_menu_bots->users_), "on_reload_attach_menu_bots");
+  td_->user_manager_->on_get_users(std::move(attach_menu_bots->users_), "on_reload_attach_menu_bots");
 
   auto new_hash = attach_menu_bots->hash_;
   vector<AttachMenuBot> new_attach_menu_bots;
@@ -722,11 +1206,6 @@ void AttachMenuManager::on_reload_attach_menu_bots(
     auto r_attach_menu_bot = get_attach_menu_bot(std::move(bot));
     if (r_attach_menu_bot.is_error()) {
       LOG(ERROR) << r_attach_menu_bot.error().message();
-      new_hash = 0;
-      continue;
-    }
-    if (!r_attach_menu_bot.ok().is_added_) {
-      LOG(ERROR) << "Receive non-added attachment menu bot " << r_attach_menu_bot.ok().user_id_;
       new_hash = 0;
       continue;
     }
@@ -745,7 +1224,7 @@ void AttachMenuManager::on_reload_attach_menu_bots(
 
     save_attach_menu_bots();
   }
-  promise.set_value(Unit());
+  set_promises(reload_attach_menu_bots_queries_);
 }
 
 void AttachMenuManager::remove_bot_from_attach_menu(UserId user_id) {
@@ -763,9 +1242,9 @@ void AttachMenuManager::remove_bot_from_attach_menu(UserId user_id) {
 
 void AttachMenuManager::get_attach_menu_bot(UserId user_id,
                                             Promise<td_api::object_ptr<td_api::attachmentMenuBot>> &&promise) {
-  TRY_RESULT_PROMISE(promise, input_user, td_->contacts_manager_->get_input_user(user_id));
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(user_id));
 
-  TRY_RESULT_PROMISE(promise, bot_data, td_->contacts_manager_->get_bot_data(user_id));
+  TRY_RESULT_PROMISE(promise, bot_data, td_->user_manager_->get_bot_data(user_id));
   if (!bot_data.can_be_added_to_attach_menu) {
     return promise.set_error(Status::Error(400, "The bot can't be added to attachment menu"));
   }
@@ -779,13 +1258,37 @@ void AttachMenuManager::get_attach_menu_bot(UserId user_id,
   td_->create_handler<GetAttachMenuBotQuery>(std::move(query_promise))->send(std::move(input_user));
 }
 
+void AttachMenuManager::reload_attach_menu_bot(UserId user_id, Promise<Unit> &&promise) {
+  if (!is_active()) {
+    return promise.set_error(Status::Error(400, "Can't reload attachment menu bot"));
+  }
+
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(user_id));
+
+  auto wrapped_promise = PromiseCreator::lambda(
+      [promise = std::move(promise)](Result<td_api::object_ptr<td_api::attachmentMenuBot>> result) mutable {
+        if (result.is_error()) {
+          promise.set_error(result.move_as_error());
+        } else {
+          promise.set_value(Unit());
+        }
+      });
+  auto query_promise =
+      PromiseCreator::lambda([actor_id = actor_id(this), user_id, promise = std::move(wrapped_promise)](
+                                 Result<telegram_api::object_ptr<telegram_api::attachMenuBotsBot>> &&result) mutable {
+        send_closure(actor_id, &AttachMenuManager::on_get_attach_menu_bot, user_id, std::move(result),
+                     std::move(promise));
+      });
+  td_->create_handler<GetAttachMenuBotQuery>(std::move(query_promise))->send(std::move(input_user));
+}
+
 void AttachMenuManager::on_get_attach_menu_bot(
     UserId user_id, Result<telegram_api::object_ptr<telegram_api::attachMenuBotsBot>> &&result,
     Promise<td_api::object_ptr<td_api::attachmentMenuBot>> &&promise) {
   TRY_STATUS_PROMISE(promise, G()->close_status());
   TRY_RESULT_PROMISE(promise, bot, std::move(result));
 
-  td_->contacts_manager_->on_get_users(std::move(bot->users_), "on_get_attach_menu_bot");
+  td_->user_manager_->on_get_users(std::move(bot->users_), "on_get_attach_menu_bot");
 
   auto r_attach_menu_bot = get_attach_menu_bot(std::move(bot->bot_));
   if (r_attach_menu_bot.is_error()) {
@@ -801,41 +1304,64 @@ void AttachMenuManager::on_get_attach_menu_bot(
     for (auto &old_bot : attach_menu_bots_) {
       if (old_bot.user_id_ == user_id) {
         is_found = true;
+        if (old_bot != attach_menu_bot) {
+          LOG(INFO) << "Update attachment menu bot " << user_id;
+
+          old_bot = attach_menu_bot;
+
+          send_update_attach_menu_bots();
+          save_attach_menu_bots();
+        }
         break;
       }
     }
     if (!is_found) {
       LOG(INFO) << "Add missing attachment menu bot " << user_id;
-    }
-    hash_ = 0;
-    attach_menu_bots_.insert(attach_menu_bots_.begin(), attach_menu_bot);
 
-    send_update_attach_menu_bots();
-    save_attach_menu_bots();
-  } else {
-    remove_bot_from_attach_menu(user_id);
+      hash_ = 0;
+      attach_menu_bots_.insert(attach_menu_bots_.begin(), attach_menu_bot);
+
+      send_update_attach_menu_bots();
+      save_attach_menu_bots();
+    }
   }
   promise.set_value(get_attachment_menu_bot_object(attach_menu_bot));
 }
 
-void AttachMenuManager::toggle_bot_is_added_to_attach_menu(UserId user_id, bool is_added, Promise<Unit> &&promise) {
+FileSourceId AttachMenuManager::get_attach_menu_bot_file_source_id(UserId user_id) {
+  if (!user_id.is_valid() || !is_active()) {
+    return FileSourceId();
+  }
+
+  auto &source_id = attach_menu_bot_file_source_ids_[user_id];
+  if (!source_id.is_valid()) {
+    source_id = td_->file_reference_manager_->create_attach_menu_bot_file_source(user_id);
+  }
+  VLOG(file_references) << "Return " << source_id << " for attach menu bot " << user_id;
+  return source_id;
+}
+
+FileSourceId AttachMenuManager::get_web_app_file_source_id(UserId user_id, const string &short_name) {
+  if (!user_id.is_valid() || !is_active()) {
+    return FileSourceId();
+  }
+
+  auto &source_id = web_app_file_source_ids_[user_id][short_name];
+  if (!source_id.is_valid()) {
+    source_id = td_->file_reference_manager_->create_web_app_file_source(user_id, short_name);
+  }
+  VLOG(file_references) << "Return " << source_id << " for Web App " << user_id << '/' << short_name;
+  return source_id;
+}
+
+void AttachMenuManager::toggle_bot_is_added_to_attach_menu(UserId user_id, bool is_added, bool allow_write_access,
+                                                           Promise<Unit> &&promise) {
   CHECK(is_active());
 
-  TRY_RESULT_PROMISE(promise, input_user, td_->contacts_manager_->get_input_user(user_id));
-
-  bool is_found = false;
-  for (auto &bot : attach_menu_bots_) {
-    if (bot.user_id_ == user_id) {
-      is_found = true;
-      break;
-    }
-  }
-  if (is_added == is_found) {
-    return promise.set_value(Unit());
-  }
+  TRY_RESULT_PROMISE(promise, input_user, td_->user_manager_->get_input_user(user_id));
 
   if (is_added) {
-    TRY_RESULT_PROMISE(promise, bot_data, td_->contacts_manager_->get_bot_data(user_id));
+    TRY_RESULT_PROMISE(promise, bot_data, td_->user_manager_->get_bot_data(user_id));
     if (!bot_data.can_be_added_to_attach_menu) {
       return promise.set_error(Status::Error(400, "The bot can't be added to attachment menu"));
     }
@@ -852,7 +1378,8 @@ void AttachMenuManager::toggle_bot_is_added_to_attach_menu(UserId user_id, bool 
         }
       });
 
-  td_->create_handler<ToggleBotInAttachMenuQuery>(std::move(query_promise))->send(std::move(input_user), is_added);
+  td_->create_handler<ToggleBotInAttachMenuQuery>(std::move(query_promise))
+      ->send(std::move(input_user), is_added, allow_write_access);
 }
 
 td_api::object_ptr<td_api::attachmentMenuBot> AttachMenuManager::get_attachment_menu_bot_object(
@@ -872,11 +1399,16 @@ td_api::object_ptr<td_api::attachmentMenuBot> AttachMenuManager::get_attachment_
   };
 
   return td_api::make_object<td_api::attachmentMenuBot>(
-      td_->contacts_manager_->get_user_id_object(bot.user_id_, "get_attachment_menu_bot_object"), bot.name_,
+      td_->user_manager_->get_user_id_object(bot.user_id_, "get_attachment_menu_bot_object"), bot.supports_self_dialog_,
+      bot.supports_user_dialogs_, bot.supports_bot_dialogs_, bot.supports_group_dialogs_,
+      bot.supports_broadcast_dialogs_, bot.request_write_access_, bot.is_added_, bot.show_in_attach_menu_,
+      bot.show_in_side_menu_, bot.side_menu_disclaimer_needed_, bot.name_,
       get_attach_menu_bot_color_object(bot.name_color_), get_file(bot.default_icon_file_id_),
       get_file(bot.ios_static_icon_file_id_), get_file(bot.ios_animated_icon_file_id_),
-      get_file(bot.android_icon_file_id_), get_file(bot.macos_icon_file_id_),
-      get_attach_menu_bot_color_object(bot.icon_color_));
+      get_file(bot.ios_side_menu_icon_file_id_), get_file(bot.android_icon_file_id_),
+      get_file(bot.android_side_menu_icon_file_id_), get_file(bot.macos_icon_file_id_),
+      get_file(bot.macos_side_menu_icon_file_id_), get_attach_menu_bot_color_object(bot.icon_color_),
+      get_file(bot.placeholder_file_id_));
 }
 
 td_api::object_ptr<td_api::updateAttachmentMenuBots> AttachMenuManager::get_update_attachment_menu_bots_object() const {
@@ -896,7 +1428,7 @@ string AttachMenuManager::get_attach_menu_bots_database_key() {
 }
 
 void AttachMenuManager::save_attach_menu_bots() {
-  if (!G()->parameters().use_chat_info_db) {
+  if (!G()->use_chat_info_database()) {
     return;
   }
 

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -14,9 +14,9 @@
 
 #include "td/utils/algorithm.h"
 #include "td/utils/ChainScheduler.h"
-#include "td/utils/format.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
+#include "td/utils/Promise.h"
 #include "td/utils/SliceBuilder.h"
 #include "td/utils/Status.h"
 #include "td/utils/StringBuilder.h"
@@ -76,7 +76,7 @@ void SequenceDispatcher::try_resend_query(Data &data, NetQueryPtr query) {
   // TODO: if query is ok, use NetQueryCallback::on_result
   if (data.callback_.empty()) {
     do_finish(data);
-    send_closure(G()->td(), &Td::on_result, std::move(query));
+    send_closure_later(G()->td(), &Td::on_result, std::move(query));
     loop();
     return;
   }
@@ -145,6 +145,7 @@ void SequenceDispatcher::on_result(NetQueryPtr query) {
       data_[i].last_timeout_ = query->last_timeout_;
       check_timeout(data_[i]);
     }
+    query->last_timeout_ = 0;
   }
 
   if (query->is_error() && (query->error().code() == NetQuery::ResendInvokeAfter ||
@@ -263,11 +264,11 @@ void MultiSequenceDispatcherOld::send(NetQueryPtr query) {
   auto it_ok = dispatchers_.emplace(sequence_id, Data{0, ActorOwn<SequenceDispatcher>()});
   auto &data = it_ok.first->second;
   if (it_ok.second) {
-    LOG(DEBUG) << "Create SequenceDispatcher" << sequence_id;
-    data.dispatcher_ = create_actor<SequenceDispatcher>("sequence dispatcher", actor_shared(this, sequence_id));
+    LOG(DEBUG) << "Create SequenceDispatcher " << sequence_id;
+    data.dispatcher_ = create_actor<SequenceDispatcher>("SequenceDispatcher", actor_shared(this, sequence_id));
   }
   data.cnt_++;
-  query->debug(PSTRING() << "send to SequenceDispatcher " << tag("sequence_id", sequence_id));
+  query->debug(PSTRING() << "send to SequenceDispatcher " << sequence_id);
   send_closure(data.dispatcher_, &SequenceDispatcher::send_with_callback, std::move(query), std::move(callback));
 }
 
@@ -322,14 +323,18 @@ class MultiSequenceDispatcherImpl final : public MultiSequenceDispatcher {
     if (net_query.empty() || net_query->is_ready()) {
       return false;
     }
-    net_query->total_timeout_ += node.total_timeout;
-    node.total_timeout = 0;
-    if (net_query->total_timeout_ > net_query->total_timeout_limit_) {
-      LOG(WARNING) << "Fail " << net_query << " to " << net_query->source_ << " because total_timeout "
-                   << net_query->total_timeout_ << " is greater than total_timeout_limit "
-                   << net_query->total_timeout_limit_;
-      net_query->set_error(Status::Error(429, PSLICE() << "Too Many Requests: retry after " << node.last_timeout));
-      return true;
+    if (node.total_timeout > 0) {
+      net_query->total_timeout_ += node.total_timeout;
+      LOG(INFO) << "Set total_timeout to " << net_query->total_timeout_ << " for " << net_query->id();
+      node.total_timeout = 0;
+
+      if (net_query->total_timeout_ > net_query->total_timeout_limit_) {
+        LOG(WARNING) << "Fail " << net_query << " to " << net_query->source_ << " because total_timeout "
+                     << net_query->total_timeout_ << " is greater than total_timeout_limit "
+                     << net_query->total_timeout_limit_;
+        net_query->set_error(Status::Error(429, PSLICE() << "Too Many Requests: retry after " << node.last_timeout));
+        return true;
+      }
     }
     return false;
   }
@@ -344,15 +349,17 @@ class MultiSequenceDispatcherImpl final : public MultiSequenceDispatcher {
       auto tl_constructor = query->tl_constructor();
       scheduler_.for_each_dependent(task_id, [&](TaskId child_task_id) {
         auto &child_node = *scheduler_.get_task_extra(child_task_id);
-        if (child_node.net_query_ref->tl_constructor() == tl_constructor) {
+        if (child_node.net_query_ref->tl_constructor() == tl_constructor && child_task_id != task_id) {
           child_node.total_timeout += query->last_timeout_;
           child_node.last_timeout = query->last_timeout_;
           to_check_timeout.push_back(child_task_id);
         }
       });
+      query->last_timeout_ = 0;
 
       for (auto dependent_task_id : to_check_timeout) {
-        if (check_timeout(*scheduler_.get_task_extra(dependent_task_id))) {
+        auto &child_node = *scheduler_.get_task_extra(dependent_task_id);
+        if (check_timeout(child_node)) {
           scheduler_.pause_task(dependent_task_id);
           try_resend(dependent_task_id);
         }
@@ -377,7 +384,7 @@ class MultiSequenceDispatcherImpl final : public MultiSequenceDispatcher {
     if (node.callback.empty()) {
       auto query = std::move(node.net_query);
       scheduler_.finish_task(task_id);
-      send_closure(G()->td(), &Td::on_result, std::move(query));
+      send_closure_later(G()->td(), &Td::on_result, std::move(query));
       loop();
       return;
     }

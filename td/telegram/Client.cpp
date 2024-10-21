@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -24,6 +24,9 @@
 #include "td/utils/port/RwMutex.h"
 #include "td/utils/port/thread.h"
 #include "td/utils/Slice.h"
+#include "td/utils/SliceBuilder.h"
+#include "td/utils/StringBuilder.h"
+#include "td/utils/utf8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -95,8 +98,7 @@ class ClientManager::Impl final {
         CHECK(concurrent_scheduler_ == nullptr);
         CHECK(options_.net_query_stats == nullptr);
         options_.net_query_stats = std::make_shared<NetQueryStats>();
-        concurrent_scheduler_ = make_unique<ConcurrentScheduler>();
-        concurrent_scheduler_->init(0);
+        concurrent_scheduler_ = make_unique<ConcurrentScheduler>(0, 0);
         concurrent_scheduler_->start();
       }
       tds_[client_id] =
@@ -246,8 +248,8 @@ class MultiTd final : public Actor {
     auto old_context = set_context(context);
     auto old_tag = set_tag(to_string(td_id));
     td = create_actor<Td>("Td", std::move(callback), options_);
-    set_context(old_context);
-    set_tag(old_tag);
+    set_context(std::move(old_context));
+    set_tag(std::move(old_tag));
   }
 
   void send(ClientManager::ClientId client_id, ClientManager::RequestId request_id,
@@ -296,7 +298,7 @@ class TdReceiver {
   unique_ptr<TdCallback> create_callback(ClientManager::ClientId client_id) {
     class Callback final : public TdCallback {
      public:
-      explicit Callback(ClientManager::ClientId client_id, std::shared_ptr<OutputQueue> output_queue)
+      Callback(ClientManager::ClientId client_id, std::shared_ptr<OutputQueue> output_queue)
           : client_id_(client_id), output_queue_(std::move(output_queue)) {
       }
       void on_result(uint64 id, td_api::object_ptr<td_api::Object> result) final {
@@ -351,8 +353,7 @@ class MultiImpl {
   static constexpr int32 ADDITIONAL_THREAD_COUNT = 3;
 
   explicit MultiImpl(std::shared_ptr<NetQueryStats> net_query_stats) {
-    concurrent_scheduler_ = std::make_shared<ConcurrentScheduler>();
-    concurrent_scheduler_->init(ADDITIONAL_THREAD_COUNT);
+    concurrent_scheduler_ = std::make_shared<ConcurrentScheduler>(ADDITIONAL_THREAD_COUNT, 0);
     concurrent_scheduler_->start();
 
     {
@@ -379,6 +380,7 @@ class MultiImpl {
   }
 
   void create(int32 td_id, unique_ptr<TdCallback> callback) {
+    LOG(INFO) << "Initialize client " << td_id;
     auto guard = concurrent_scheduler_->get_send_guard();
     send_closure(multi_td_, &MultiTd::create, td_id, std::move(callback));
   }
@@ -394,6 +396,7 @@ class MultiImpl {
   }
 
   void close(ClientManager::ClientId client_id) {
+    LOG(INFO) << "Close client";
     auto guard = concurrent_scheduler_->get_send_guard();
     send_closure(multi_td_, &MultiTd::close, client_id);
   }
@@ -420,6 +423,7 @@ class MultiImpl {
   static std::atomic<uint32> current_id_;
 };
 
+constexpr int32 MultiImpl::ADDITIONAL_THREAD_COUNT;
 std::atomic<uint32> MultiImpl::current_id_{1};
 
 class MultiImplPool {
@@ -476,6 +480,7 @@ class ClientManager::Impl final {
  public:
   ClientId create_client_id() {
     auto client_id = MultiImpl::create_id();
+    LOG(INFO) << "Created managed client " << client_id;
     {
       auto lock = impls_mutex_.lock_write().move_as_ok();
       impls_[client_id];  // create empty MultiImplInfo
@@ -519,6 +524,7 @@ class ClientManager::Impl final {
         response.object->get_id() == td_api::updateAuthorizationState::ID &&
         static_cast<const td_api::updateAuthorizationState *>(response.object.get())->authorization_state_->get_id() ==
             td_api::authorizationStateClosed::ID) {
+      LOG(INFO) << "Release closed client";
       auto lock = impls_mutex_.lock_write().move_as_ok();
       close_impl(response.client_id);
 
@@ -565,6 +571,7 @@ class ClientManager::Impl final {
     if (ExitGuard::is_exited()) {
       return;
     }
+    LOG(INFO) << "Destroy ClientManager";
     for (auto &it : impls_) {
       close_impl(it.first);
     }
@@ -590,6 +597,7 @@ class Client::Impl final {
     static MultiImplPool pool;
     multi_impl_ = pool.get();
     td_id_ = MultiImpl::create_id();
+    LOG(INFO) << "Create client " << td_id_;
     multi_impl_->create(td_id_, receiver_.create_callback(td_id_));
   }
 
@@ -616,6 +624,7 @@ class Client::Impl final {
   Impl(Impl &&) = delete;
   Impl &operator=(Impl &&) = delete;
   ~Impl() {
+    LOG(INFO) << "Destroy Client";
     multi_impl_->close(td_id_);
     while (!ExitGuard::is_exited()) {
       auto response = receiver_.receive(0.1, false);
@@ -651,8 +660,8 @@ Client::Response Client::execute(Request &&request) {
   return response;
 }
 
-Client::Client(Client &&other) noexcept = default;
-Client &Client::operator=(Client &&other) noexcept = default;
+Client::Client(Client &&) noexcept = default;
+Client &Client::operator=(Client &&) noexcept = default;
 Client::~Client() = default;
 
 ClientManager::ClientManager() : impl_(std::make_unique<Impl>()) {
@@ -679,7 +688,18 @@ static std::atomic<ClientManager::LogMessageCallbackPtr> log_message_callback;
 static void log_message_callback_wrapper(int verbosity_level, CSlice message) {
   auto callback = log_message_callback.load(std::memory_order_relaxed);
   if (callback != nullptr) {
-    callback(verbosity_level, message.c_str());
+    if (check_utf8(message)) {
+      callback(verbosity_level, message.c_str());
+    } else {
+      size_t pos = 0;
+      while (1 <= message[pos] && message[pos] <= 126) {
+        pos++;
+      }
+      CHECK(pos + 1 < message.size());
+      auto utf8_message = PSTRING() << message.substr(0, pos)
+                                    << url_encode(message.substr(pos, message.size() - pos - 1)) << '\n';
+      callback(verbosity_level, utf8_message.c_str());
+    }
   }
 }
 
@@ -693,8 +713,8 @@ void ClientManager::set_log_message_callback(int max_verbosity_level, LogMessage
   }
 }
 
-ClientManager::ClientManager(ClientManager &&other) noexcept = default;
-ClientManager &ClientManager::operator=(ClientManager &&other) noexcept = default;
+ClientManager::ClientManager(ClientManager &&) noexcept = default;
+ClientManager &ClientManager::operator=(ClientManager &&) noexcept = default;
 ClientManager::~ClientManager() = default;
 
 ClientManager *ClientManager::get_manager_singleton() {

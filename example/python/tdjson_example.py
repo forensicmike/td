@@ -1,6 +1,6 @@
 #
 # Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com),
-# Pellegrino Prevete (pellegrinoprevete@gmail.com)  2014-2022
+# Pellegrino Prevete (pellegrinoprevete@gmail.com)  2014-2024
 #
 # Distributed under the Boost Software License, Version 1.0. (See accompanying
 # file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -8,12 +8,16 @@
 from ctypes.util import find_library
 from ctypes import *
 import json
+import os
 import sys
 
 # load shared library
-tdjson_path = find_library('tdjson') or 'tdjson.dll'
+tdjson_path = find_library('tdjson')
 if tdjson_path is None:
-    sys.exit("Can't find 'tdjson' library")
+    if os.name == 'nt':
+        tdjson_path = os.path.join(os.path.dirname(__file__), 'tdjson.dll')
+    else:
+        sys.exit("Can't find 'tdjson' library")
 tdjson = CDLL(tdjson_path)
 
 # load TDLib functions from shared library
@@ -75,8 +79,8 @@ def td_receive():
 # another test for TDLib execute method
 print(str(td_execute({'@type': 'getTextEntities', 'text': '@telegram /test_command https://telegram.org telegram.me', '@extra': ['5', 7.0, 'a']})).encode('utf-8'))
 
-# start the client by sending request to it
-td_send({'@type': 'getAuthorizationState', '@extra': 1.01234})
+# start the client by sending a request to it
+td_send({'@type': 'getOption', 'name': 'version', '@extra': 1.01234})
 
 # main events cycle
 while True:
@@ -94,25 +98,31 @@ while True:
             # you MUST obtain your own api_id and api_hash at https://my.telegram.org
             # and use them in the setTdlibParameters call
             if auth_state['@type'] == 'authorizationStateWaitTdlibParameters':
-                td_send({'@type': 'setTdlibParameters', 'parameters': {
-                                                       'database_directory': 'tdlib',
-                                                       'use_message_database': True,
-                                                       'use_secret_chats': True,
-                                                       'api_id': 94575,
-                                                       'api_hash': 'a3406de8d171bb422bb6ddf3bbd800e2',
-                                                       'system_language_code': 'en',
-                                                       'device_model': 'Desktop',
-                                                       'application_version': '1.0',
-                                                       'enable_storage_optimizer': True}})
-
-            # set an encryption key for database to let know TDLib how to open the database
-            if auth_state['@type'] == 'authorizationStateWaitEncryptionKey':
-                td_send({'@type': 'checkDatabaseEncryptionKey', 'encryption_key': ''})
+                td_send({'@type': 'setTdlibParameters',
+                         'database_directory': 'tdlib',
+                         'use_message_database': True,
+                         'use_secret_chats': True,
+                         'api_id': 94575,
+                         'api_hash': 'a3406de8d171bb422bb6ddf3bbd800e2',
+                         'system_language_code': 'en',
+                         'device_model': 'Desktop',
+                         'application_version': '1.0'})
 
             # enter phone number to log in
             if auth_state['@type'] == 'authorizationStateWaitPhoneNumber':
                 phone_number = input('Please enter your phone number: ')
                 td_send({'@type': 'setAuthenticationPhoneNumber', 'phone_number': phone_number})
+
+            # enter email address to log in
+            if auth_state['@type'] == 'authorizationStateWaitEmailAddress':
+                email_address = input('Please enter your email address: ')
+                td_send({'@type': 'setAuthenticationEmailAddress', 'email_address': email_address})
+
+            # wait for email authorization code
+            if auth_state['@type'] == 'authorizationStateWaitEmailCode':
+                code = input('Please enter the email authentication code you received: ')
+                td_send({'@type': 'checkAuthenticationEmailCode',
+                         'code': {'@type': 'emailAddressAuthenticationCode', 'code' : code}})
 
             # wait for authorization code
             if auth_state['@type'] == 'authorizationStateWaitCode':

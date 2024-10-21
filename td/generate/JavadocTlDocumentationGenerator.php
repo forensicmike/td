@@ -15,7 +15,7 @@ class JavadocTlDocumentationGenerator extends TlDocumentationGenerator
             {
                 return preg_replace_callback('/_([A-Za-z])/', function ($matches) {return strtoupper($matches[1]);}, $word_matches[0]);
             }, $doc);
-        $doc = htmlspecialchars($doc);
+        $doc = htmlspecialchars($doc, ENT_COMPAT, 'UTF-8');
         $doc = str_replace('*/', '*&#47;', $doc);
         return $doc;
     }
@@ -143,16 +143,27 @@ EOT
 EOT
 );
 
+        $this->addDocumentation("        public Object() {", <<<EOT
+        /**
+         * Default Object constructor.
+         */
+EOT
+);
+
         $this->addDocumentation('        public abstract int getConstructor();', <<<EOT
         /**
-         * @return identifier uniquely determining type of the object.
+         * Returns an identifier uniquely determining type of the object.
+         *
+         * @return a unique identifier of the object type.
          */
 EOT
 );
 
         $this->addDocumentation('        public native String toString();', <<<EOT
         /**
-         * @return string representation of the object.
+         * Returns a string representation of the object.
+         *
+         * @return a string representation of the object.
          */
 EOT
 );
@@ -160,7 +171,16 @@ EOT
         $this->addDocumentation('    public abstract static class Function<R extends Object> extends Object {', <<<EOT
     /**
      * This class is a base class for all TDLib interface function-classes.
+     *
+     * @param <R> The object type that is returned by the function
      */
+EOT
+);
+
+        $this->addDocumentation("        public Function() {", <<<EOT
+        /**
+         * Default Function constructor.
+         */
 EOT
 );
 
@@ -186,6 +206,12 @@ EOT
      * This class is an abstract base class.
      * $documentation
      */
+EOT
+);
+        $this->addDocumentation("        public $class_name() {", <<<EOT
+        /**
+         * Default class constructor.
+         */
 EOT
 );
     }

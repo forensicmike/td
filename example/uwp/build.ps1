@@ -3,7 +3,8 @@ param (
   [string]$arch = "",
   [string]$mode = "all",
   [string]$compress = "7z",
-  [switch]$release_only = $false
+  [switch]$release_only = $false,
+  [switch]$nupkg = $false
 )
 $ErrorActionPreference = "Stop"
 
@@ -15,7 +16,7 @@ if ($arch) {
   $arch_list = @(, $arch)
 }
 $config_list = @( "Debug", "Release" )
-if ($release_only) {
+if ($release_only -or $nupkg) {
   $config_list = @(, "RelWithDebInfo")
 }
 $targets = @{ Debug = "Debug"; Release = "Retail"; RelWithDebInfo = "CommonConfiguration"}
@@ -41,9 +42,9 @@ function prepare {
 
   cd build-native
 
-  cmake "$td_root" -DCMAKE_TOOLCHAIN_FILE="$vcpkg_cmake" -DTD_ENABLE_DOTNET=ON
+  cmake -A Win32 -DTD_GENERATE_SOURCE_FILES=ON -DTD_ENABLE_DOTNET=ON "$td_root"
   CheckLastExitCode
-  cmake --build . --target prepare_cross_compiling
+  cmake --build .
   CheckLastExitCode
 
   cd ..
@@ -62,7 +63,7 @@ function config {
     if ($arch -eq "x86") {
       $fixed_arch = "win32"
     }
-    cmake "$td_root" -A $fixed_arch -DCMAKE_SYSTEM_VERSION="10.0" -DCMAKE_SYSTEM_NAME="WindowsStore" -DCMAKE_TOOLCHAIN_FILE="$vcpkg_cmake" -DTD_ENABLE_DOTNET=ON
+    cmake -A $fixed_arch -DCMAKE_SYSTEM_VERSION="10.0" -DCMAKE_SYSTEM_NAME="WindowsStore" -DCMAKE_TOOLCHAIN_FILE="$vcpkg_cmake" -DTD_ENABLE_DOTNET=ON "$td_root"
     CheckLastExitCode
     cd ..
   }
@@ -77,13 +78,14 @@ function build {
     cd $arch
     ForEach ($config in $config_list) {
       cmake --build . --config $config --target tddotnet
+      CheckLastExitCode
     }
     cd ..
   }
   cd ..
 }
 
-function export {
+function export-vsix {
   cd build-uwp
   Remove-Item vsix -Force -Recurse -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path vsix
@@ -119,6 +121,29 @@ function export {
   cd ..
 }
 
+function export-nupkg {
+  cd build-uwp
+  Remove-Item nupkg -Force -Recurse -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path nupkg/build/native
+  cp ../LICENSE_1_0.txt nupkg
+  cp ../Telegram.Td.UWP.nuspec nupkg
+  cp ../Telegram.Td.UWP.targets nupkg/build/native
+
+  ForEach ($arch in $arch_list) {
+    New-Item -ItemType Directory -Force -Path nupkg/runtimes/win10-${arch}/native
+    New-Item -ItemType Directory -Force -Path nupkg/lib/uap10.0
+
+    ForEach ($config in $config_list) {
+      cp ${arch}/${config}/* -include "SSLEAY*","LIBEAY*","libcrypto*","libssl*","zlib*","Telegram.Td.pdb","Telegram.Td.pri","Telegram.Td.dll" nupkg/runtimes/win10-${arch}/native
+      cp ${arch}/${config}/* -include "Telegram.Td.winmd","Telegram.Td.xml" nupkg/lib/uap10.0
+    }
+  }
+
+  cd nupkg
+  nuget pack Telegram.Td.UWP.nuspec
+  cd ..
+}
+
 function run {
   Push-Location
   Try {
@@ -135,7 +160,11 @@ function run {
       build
     }
     if (($mode -eq "export") -or ($mode -eq "all")) {
-      export
+      if ($nupkg) {
+        export-nupkg
+      } else {
+        export-vsix
+      }
     }
   } Finally {
     Pop-Location

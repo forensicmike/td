@@ -1,14 +1,13 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/ConfigManager.h"
-#include "td/telegram/net/DcId.h"
-#include "td/telegram/net/PublicRsaKeyShared.h"
-#include "td/telegram/net/Session.h"
+#include "td/telegram/net/PublicRsaKeySharedMain.h"
 #include "td/telegram/NotificationManager.h"
+#include "td/telegram/telegram_api.h"
 
 #include "td/mtproto/AuthData.h"
 #include "td/mtproto/DhCallback.h"
@@ -29,16 +28,17 @@
 
 #include "td/actor/actor.h"
 #include "td/actor/ConcurrentScheduler.h"
-#include "td/actor/PromiseFuture.h"
 
 #include "td/utils/base64.h"
 #include "td/utils/BufferedFd.h"
 #include "td/utils/common.h"
 #include "td/utils/crypto.h"
+#include "td/utils/HttpDate.h"
 #include "td/utils/logging.h"
 #include "td/utils/port/Clocks.h"
 #include "td/utils/port/IPAddress.h"
 #include "td/utils/port/SocketFd.h"
+#include "td/utils/Promise.h"
 #include "td/utils/Random.h"
 #include "td/utils/Slice.h"
 #include "td/utils/SliceBuilder.h"
@@ -46,10 +46,11 @@
 #include "td/utils/tests.h"
 #include "td/utils/Time.h"
 
+#include <memory>
+
 TEST(Mtproto, GetHostByNameActor) {
-  td::ConcurrentScheduler sched;
   int threads_n = 1;
-  sched.init(threads_n);
+  td::ConcurrentScheduler sched(threads_n, 0);
 
   int cnt = 1;
   td::vector<td::ActorOwn<td::GetHostByNameActor>> actors;
@@ -139,9 +140,8 @@ TEST(Time, parse_http_date) {
 }
 
 TEST(Mtproto, config) {
-  td::ConcurrentScheduler sched;
   int threads_n = 0;
-  sched.init(threads_n);
+  td::ConcurrentScheduler sched(threads_n, 0);
 
   int cnt = 1;
   {
@@ -167,7 +167,7 @@ TEST(Mtproto, config) {
             }
           });
       cnt++;
-      func(std::move(promise), nullptr, is_test, -1).release();
+      func(std::move(promise), false, td::Slice(), is_test, -1).release();
     };
 
     run(td::get_simple_config_azure, false);
@@ -196,7 +196,7 @@ TEST(Mtproto, encrypted_config) {
       "FnWWdEV+BPJeOTk+ARHcNkuJBt0CqnfcVCoDOpKqGyq0U31s2MOpQvHgAG+Tlpg02syuH0E4dCGRw5CbJPARiynteb9y5fT5x/"
       "kmdp6BMR5tWQSQF0liH16zLh8BDSIdiMsikdcwnAvBwdNhRqQBqGx9MTh62MDmlebjtczE9Gz0z5cscUO2yhzGdphgIy6SP+"
       "bwaqLWYF0XdPGjKLMUEJW+rou6fbL1t/EUXPtU0XmQAnO0Fh86h+AqDMOe30N4qKrPQ==   ";
-  auto config = td::decode_config(data).move_as_ok();
+  td::telegram_api::object_ptr<td::telegram_api::help_configSimple> config = td::decode_config(data).move_as_ok();
 }
 
 class TestPingActor final : public td::Actor {
@@ -243,7 +243,7 @@ class TestPingActor final : public td::Actor {
       return stop();
     }
     if (ping_connection_->was_pong()) {
-      LOG(INFO) << "GOT PONG";
+      LOG(INFO) << "Receive pong";
       return stop();
     }
   }
@@ -273,7 +273,6 @@ class Mtproto_ping final : public td::Test {
   using Test::Test;
   bool step() final {
     if (!is_inited_) {
-      sched_.init(0);
       sched_.create_actor_unsafe<TestPingActor>(0, "Pinger", get_default_ip_address(), &result_).release();
       sched_.start();
       is_inited_ = true;
@@ -292,7 +291,7 @@ class Mtproto_ping final : public td::Test {
 
  private:
   bool is_inited_ = false;
-  td::ConcurrentScheduler sched_;
+  td::ConcurrentScheduler sched_{0, 0};
   td::Status result_;
 };
 td::RegisterTest<Mtproto_ping> mtproto_ping("Mtproto_ping");
@@ -303,11 +302,11 @@ class HandshakeContext final : public td::mtproto::AuthKeyHandshakeContext {
     return nullptr;
   }
   td::mtproto::PublicRsaKeyInterface *get_public_rsa_key_interface() final {
-    return &public_rsa_key;
+    return public_rsa_key_.get();
   }
 
  private:
-  td::PublicRsaKeyShared public_rsa_key{td::DcId::empty(), true};
+  std::shared_ptr<td::mtproto::PublicRsaKeyInterface> public_rsa_key_ = td::PublicRsaKeySharedMain::create(true);
 };
 
 class HandshakeTestActor final : public td::Actor {
@@ -368,11 +367,11 @@ class HandshakeTestActor final : public td::Actor {
           10.0,
           td::PromiseCreator::lambda(
               [actor_id = actor_id(this)](td::Result<td::unique_ptr<td::mtproto::RawConnection>> raw_connection) {
-                td::send_closure(actor_id, &HandshakeTestActor::got_connection, std::move(raw_connection), 1);
+                td::send_closure(actor_id, &HandshakeTestActor::on_connection, std::move(raw_connection), 1);
               }),
           td::PromiseCreator::lambda(
               [actor_id = actor_id(this)](td::Result<td::unique_ptr<td::mtproto::AuthKeyHandshake>> handshake) {
-                td::send_closure(actor_id, &HandshakeTestActor::got_handshake, std::move(handshake), 1);
+                td::send_closure(actor_id, &HandshakeTestActor::on_handshake, std::move(handshake), 1);
               }))
           .release();
       wait_for_raw_connection_ = true;
@@ -380,7 +379,7 @@ class HandshakeTestActor final : public td::Actor {
     }
   }
 
-  void got_connection(td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_raw_connection, bool dummy) {
+  void on_connection(td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_raw_connection, bool dummy) {
     CHECK(wait_for_raw_connection_);
     wait_for_raw_connection_ = false;
     if (r_raw_connection.is_ok()) {
@@ -393,7 +392,7 @@ class HandshakeTestActor final : public td::Actor {
     loop();
   }
 
-  void got_handshake(td::Result<td::unique_ptr<td::mtproto::AuthKeyHandshake>> r_handshake, bool dummy) {
+  void on_handshake(td::Result<td::unique_ptr<td::mtproto::AuthKeyHandshake>> r_handshake, bool dummy) {
     CHECK(wait_for_handshake_);
     wait_for_handshake_ = false;
     CHECK(r_handshake.is_ok());
@@ -416,7 +415,6 @@ class Mtproto_handshake final : public td::Test {
   using Test::Test;
   bool step() final {
     if (!is_inited_) {
-      sched_.init(0);
       sched_.create_actor_unsafe<HandshakeTestActor>(0, "HandshakeTestActor", get_default_dc_id(), &result_).release();
       sched_.start();
       is_inited_ = true;
@@ -435,7 +433,7 @@ class Mtproto_handshake final : public td::Test {
 
  private:
   bool is_inited_ = false;
-  td::ConcurrentScheduler sched_;
+  td::ConcurrentScheduler sched_{0, 0};
   td::Status result_;
 };
 td::RegisterTest<Mtproto_handshake> mtproto_handshake("Mtproto_handshake");
@@ -470,7 +468,7 @@ class Socks5TestActor final : public td::Actor {
     if (r_socket.is_error()) {
       return promise.set_error(td::Status::Error(PSTRING() << "Failed to open socket: " << r_socket.error()));
     }
-    td::create_actor<td::Socks5>("socks5", r_socket.move_as_ok(), mtproto_ip_address, "", "",
+    td::create_actor<td::Socks5>("Socks5", r_socket.move_as_ok(), mtproto_ip_address, "", "",
                                  td::make_unique<Callback>(std::move(promise)), actor_shared(this))
         .release();
   }
@@ -484,9 +482,8 @@ class Socks5TestActor final : public td::Actor {
 
 TEST(Mtproto, socks5) {
   return;
-  td::ConcurrentScheduler sched;
   int threads_n = 0;
-  sched.init(threads_n);
+  td::ConcurrentScheduler sched(threads_n, 0);
 
   sched.create_actor_unsafe<Socks5TestActor>(0, "Socks5TestActor").release();
   sched.start();
@@ -558,16 +555,16 @@ class FastPingTestActor final : public td::Actor {
         "HandshakeActor", std::move(handshake), std::move(raw_connection), td::make_unique<HandshakeContext>(), 10.0,
         td::PromiseCreator::lambda(
             [actor_id = actor_id(this)](td::Result<td::unique_ptr<td::mtproto::RawConnection>> raw_connection) {
-              td::send_closure(actor_id, &FastPingTestActor::got_connection, std::move(raw_connection), 1);
+              td::send_closure(actor_id, &FastPingTestActor::on_connection, std::move(raw_connection), 1);
             }),
         td::PromiseCreator::lambda(
             [actor_id = actor_id(this)](td::Result<td::unique_ptr<td::mtproto::AuthKeyHandshake>> handshake) {
-              td::send_closure(actor_id, &FastPingTestActor::got_handshake, std::move(handshake), 1);
+              td::send_closure(actor_id, &FastPingTestActor::on_handshake, std::move(handshake), 1);
             }))
         .release();
   }
 
-  void got_connection(td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_raw_connection, bool dummy) {
+  void on_connection(td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_raw_connection, bool dummy) {
     if (r_raw_connection.is_error()) {
       *result_ = r_raw_connection.move_as_error();
       LOG(INFO) << "Receive " << *result_ << " instead of a connection";
@@ -577,7 +574,7 @@ class FastPingTestActor final : public td::Actor {
     loop();
   }
 
-  void got_handshake(td::Result<td::unique_ptr<td::mtproto::AuthKeyHandshake>> r_handshake, bool dummy) {
+  void on_handshake(td::Result<td::unique_ptr<td::mtproto::AuthKeyHandshake>> r_handshake, bool dummy) {
     if (r_handshake.is_error()) {
       *result_ = r_handshake.move_as_error();
       LOG(INFO) << "Receive " << *result_ << " instead of a handshake";
@@ -587,7 +584,7 @@ class FastPingTestActor final : public td::Actor {
     loop();
   }
 
-  void got_raw_connection(td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_connection) {
+  void on_raw_connection(td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_connection) {
     if (r_connection.is_error()) {
       *result_ = r_connection.move_as_error();
       LOG(INFO) << "Receive " << *result_ << " instead of a handshake";
@@ -609,7 +606,7 @@ class FastPingTestActor final : public td::Actor {
       if (iteration_ % 2 == 0) {
         auth_data = td::make_unique<td::mtproto::AuthData>();
         auth_data->set_tmp_auth_key(handshake_->get_auth_key());
-        auth_data->set_server_time_difference(handshake_->get_server_time_diff());
+        auth_data->reset_server_time_difference(handshake_->get_server_time_diff());
         auth_data->set_server_salt(handshake_->get_server_salt(), td::Time::now());
         auth_data->set_future_salts({td::mtproto::ServerSalt{0u, 1e20, 1e30}}, td::Time::now());
         auth_data->set_use_pfs(true);
@@ -624,7 +621,7 @@ class FastPingTestActor final : public td::Actor {
           td::Slice(), std::move(connection_), std::move(auth_data),
           td::PromiseCreator::lambda(
               [actor_id = actor_id(this)](td::Result<td::unique_ptr<td::mtproto::RawConnection>> r_raw_connection) {
-                td::send_closure(actor_id, &FastPingTestActor::got_raw_connection, std::move(r_raw_connection));
+                td::send_closure(actor_id, &FastPingTestActor::on_raw_connection, std::move(r_raw_connection));
               }),
           td::ActorShared<>());
     }
@@ -640,7 +637,6 @@ class Mtproto_FastPing final : public td::Test {
   using Test::Test;
   bool step() final {
     if (!is_inited_) {
-      sched_.init(0);
       sched_.create_actor_unsafe<FastPingTestActor>(0, "FastPingTestActor", &result_).release();
       sched_.start();
       is_inited_ = true;
@@ -659,7 +655,7 @@ class Mtproto_FastPing final : public td::Test {
 
  private:
   bool is_inited_ = false;
-  td::ConcurrentScheduler sched_;
+  td::ConcurrentScheduler sched_{0, 0};
   td::Status result_;
 };
 td::RegisterTest<Mtproto_FastPing> mtproto_fastping("Mtproto_FastPing");
@@ -676,9 +672,8 @@ TEST(Mtproto, Grease) {
 }
 
 TEST(Mtproto, TlsTransport) {
-  td::ConcurrentScheduler sched;
   int threads_n = 1;
-  sched.init(threads_n);
+  td::ConcurrentScheduler sched(threads_n, 0);
   {
     auto guard = sched.get_main_guard();
     class RunTest final : public td::Actor {

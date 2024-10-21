@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -50,7 +50,7 @@ class RangeSet {
     RangeSet res;
     for (auto begin = data.ubegin(); begin != data.uend();) {
       uint32 size;
-      begin = next_utf8_unsafe(begin, &size, "RangeSet");
+      begin = next_utf8_unsafe(begin, &size);
 
       if (!is_empty && size != 0) {
         res.ranges_.push_back({curr * BIT_SIZE, (curr + size) * BIT_SIZE});

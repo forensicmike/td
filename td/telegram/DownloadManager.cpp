@@ -1,20 +1,19 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/DownloadManager.h"
 
-#include "td/telegram/FileReferenceManager.h"
 #include "td/telegram/files/FileId.hpp"
 #include "td/telegram/files/FileSourceId.hpp"
 #include "td/telegram/Global.h"
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/TdDb.h"
-#include "td/telegram/TdParameters.h"
 
 #include "td/actor/MultiPromise.h"
+#include "td/actor/PromiseFuture.h"
 
 #include "td/utils/algorithm.h"
 #include "td/utils/FlatHashMap.h"
@@ -24,6 +23,7 @@
 #include "td/utils/misc.h"
 #include "td/utils/Slice.h"
 #include "td/utils/SliceBuilder.h"
+#include "td/utils/Status.h"
 #include "td/utils/tl_helpers.h"
 
 #include <algorithm>
@@ -79,88 +79,74 @@ class DownloadManagerImpl final : public DownloadManager {
   }
 
   void after_get_difference() final {
-    load_database_files();
+    load_database_files("after_get_difference");
   }
 
-  Status toggle_is_paused(FileId file_id, bool is_paused) final {
-    TRY_STATUS(check_is_active());
-    TRY_RESULT(file_info_ptr, get_file_info(file_id));
+  void toggle_is_paused(FileId file_id, bool is_paused, Promise<Unit> promise) final {
+    TRY_STATUS_PROMISE(promise, check_is_active("toggle_is_paused"));
+    TRY_RESULT_PROMISE(promise, file_info_ptr, get_file_info_ptr(file_id));
     toggle_is_paused(*file_info_ptr, is_paused);
-    return Status::OK();
+    promise.set_value(Unit());
   }
 
-  Status toggle_all_is_paused(bool is_paused) final {
-    TRY_STATUS(check_is_active());
+  void toggle_all_is_paused(bool is_paused, Promise<Unit> promise) final {
+    TRY_STATUS_PROMISE(promise, check_is_active("toggle_all_is_paused"));
 
-    for (auto &it : files_) {
-      toggle_is_paused(*it.second, is_paused);
+    vector<FileId> to_toggle;
+    for (const auto &it : files_) {
+      const FileInfo &file_info = *it.second;
+      if (!is_completed(file_info) && is_paused != file_info.is_paused) {
+        to_toggle.push_back(file_info.file_id);
+      }
+    }
+    for (auto file_id : to_toggle) {
+      auto r_file_info_ptr = get_file_info_ptr(file_id);
+      if (r_file_info_ptr.is_ok()) {
+        toggle_is_paused(*r_file_info_ptr.ok(), is_paused);
+      }
     }
 
-    return Status::OK();
+    promise.set_value(Unit());
   }
 
-  Status remove_file(FileId file_id, FileSourceId file_source_id, bool delete_from_cache) final {
-    LOG(INFO) << "Remove from downloads file " << file_id << " from " << file_source_id;
-    TRY_STATUS(check_is_active());
-    TRY_RESULT(file_info_ptr, get_file_info(file_id, file_source_id));
-    auto &file_info = *file_info_ptr;
-    auto download_id = file_info.download_id;
-    if (!is_completed(file_info) && !file_info.is_paused) {
-      callback_->pause_file(file_info.internal_file_id);
-    }
-    unregister_file_info(file_info);
-    if (delete_from_cache) {
-      callback_->delete_file(file_info.internal_file_id);
-    }
-    by_internal_file_id_.erase(file_info.internal_file_id);
-    by_file_id_.erase(file_info.file_id);
-    hints_.remove(download_id);
-    completed_download_ids_.erase(download_id);
-
-    remove_from_database(file_info);
-    files_.erase(download_id);
-    if (is_search_inited_) {
-      callback_->update_file_removed(file_id, file_counters_);
-    }
-
-    update_counters();
-    on_file_viewed(download_id);
-
-    return Status::OK();
+  void remove_file(FileId file_id, FileSourceId file_source_id, bool delete_from_cache, Promise<Unit> promise) final {
+    TRY_STATUS_PROMISE(promise, check_is_active("remove_file"));
+    TRY_RESULT_PROMISE(promise, file_info_ptr, get_file_info_ptr(file_id, file_source_id));
+    remove_file_impl(*file_info_ptr, delete_from_cache, "remove_file");
+    promise.set_value(Unit());
   }
 
-  Status remove_file_if_finished(FileId file_id) {
-    TRY_STATUS(check_is_active());
-    TRY_RESULT(file_info_ptr, get_file_info(file_id, {}));
-    if (!is_completed(*file_info_ptr)) {
-      return Status::Error("File is active");
-    }
-    return remove_file(file_id, {}, false);
+  void remove_file_if_finished(FileId file_id) final {
+    remove_file_if_finished_impl(file_id).ignore();
   }
 
-  Status remove_all_files(bool only_active, bool only_completed, bool delete_from_cache) final {
-    TRY_STATUS(check_is_active());
-    vector<FileId> to_remove;
-    for (auto &it : files_) {
-      FileInfo &file_info = *it.second;
+  void remove_all_files(bool only_active, bool only_completed, bool delete_from_cache, Promise<Unit> promise) final {
+    TRY_STATUS_PROMISE(promise, check_is_active("remove_all_files"));
+    vector<const FileInfo *> to_remove;
+    for (const auto &it : files_) {
+      const FileInfo &file_info = *it.second;
       if (only_active && is_completed(file_info)) {
         continue;
       }
       if (only_completed && !is_completed(file_info)) {
         continue;
       }
-      to_remove.push_back(file_info.file_id);
+      to_remove.push_back(&file_info);
     }
-    for (auto file_id : to_remove) {
-      remove_file(file_id, {}, delete_from_cache);
+    for (auto file_info_ptr : to_remove) {
+      remove_file_impl(*file_info_ptr, delete_from_cache, "remove_all_files");
     }
-    return Status::OK();
+    promise.set_value(Unit());
   }
 
-  Status add_file(FileId file_id, FileSourceId file_source_id, string search_text, int8 priority) final {
-    TRY_STATUS(check_is_active());
+  void add_file(FileId file_id, FileSourceId file_source_id, string search_text, int8 priority,
+                Promise<td_api::object_ptr<td_api::file>> promise) final {
+    TRY_STATUS_PROMISE(promise, check_is_active("add_file"));
 
-    remove_file(file_id, {}, false);
+    auto old_file_info_ptr = get_file_info_ptr(file_id);
+    if (old_file_info_ptr.is_ok()) {
+      remove_file_impl(*old_file_info_ptr.ok(), false, "add_file");
+    }
 
     auto download_id = next_download_id();
 
@@ -175,19 +161,23 @@ class DownloadManagerImpl final : public DownloadManager {
 
     add_file_info(std::move(file_info), search_text);
 
-    return Status::OK();
+    promise.set_value(callback_->get_file_object(file_id));
   }
 
-  Status change_search_text(FileId file_id, FileSourceId file_source_id, string search_text) final {
+  void change_search_text(FileId file_id, FileSourceId file_source_id, string search_text) final {
     if (!is_search_inited_) {
-      return Status::OK();
+      return;
     }
 
-    TRY_STATUS(check_is_active());
-    TRY_RESULT(file_info_ptr, get_file_info(file_id, file_source_id));
-    auto &file_info = *file_info_ptr;
+    if (check_is_active("change_search_text").is_error()) {
+      return;
+    }
+    auto r_file_info_ptr = get_file_info_ptr(file_id, file_source_id);
+    if (r_file_info_ptr.is_error()) {
+      return;
+    }
+    auto &file_info = *r_file_info_ptr.ok();
     hints_.add(file_info.download_id, search_text.empty() ? string(" ") : search_text);
-    return Status::OK();
   }
 
   void hints_synchronized(Result<Unit>) {
@@ -208,7 +198,7 @@ class DownloadManagerImpl final : public DownloadManager {
   void do_search(string query, bool only_active, bool only_completed, string offset, int32 limit,
                  Promise<td_api::object_ptr<td_api::foundFileDownloads>> promise, Result<Unit>) {
     TRY_STATUS_PROMISE(promise, G()->close_status());
-    TRY_STATUS_PROMISE(promise, check_is_active());
+    TRY_STATUS_PROMISE(promise, check_is_active("do_search"));
 
     if (!is_search_inited_) {
       Promise<Unit> lock;
@@ -240,9 +230,9 @@ class DownloadManagerImpl final : public DownloadManager {
     auto download_ids = hints_.search(query, 10000, true).second;
     FileCounters counters;
     td::remove_if(download_ids, [&](int64 download_id) {
-      auto r = get_file_info(download_id);
-      CHECK(r.is_ok());
-      auto &file_info = *r.ok();
+      auto r_file_info_ptr = get_file_info_ptr(download_id);
+      CHECK(r_file_info_ptr.is_ok());
+      auto &file_info = *r_file_info_ptr.ok();
       if (is_completed(file_info)) {
         counters.completed_count++;
         if (only_active) {
@@ -284,14 +274,14 @@ class DownloadManagerImpl final : public DownloadManager {
                                                                       std::move(file_downloads), next_offset));
   }
 
-  void update_file_download_state(FileId internal_file_id, int64 downloaded_size, int64 size, int64 expected_size,
+  void update_file_download_state(FileId file_id, int64 downloaded_size, int64 size, int64 expected_size,
                                   bool is_paused) final {
     if (!callback_ || !is_database_loaded_) {
       return;
     }
-    LOG(INFO) << "Update file download state for file " << internal_file_id << " of size " << size << '/'
-              << expected_size << " to downloaded_size = " << downloaded_size << " and is_paused = " << is_paused;
-    auto r_file_info_ptr = get_file_info_by_internal(internal_file_id);
+    LOG(INFO) << "Update file download state for file " << file_id << " of size " << size << '/' << expected_size
+              << " to downloaded_size = " << downloaded_size << " and is_paused = " << is_paused;
+    auto r_file_info_ptr = get_file_info_ptr(file_id);
     if (r_file_info_ptr.is_error()) {
       return;
     }
@@ -317,26 +307,13 @@ class DownloadManagerImpl final : public DownloadManager {
     }
   }
 
-  void update_file_deleted(FileId internal_file_id) final {
-    if (!callback_ || !is_database_loaded_) {
-      return;
-    }
-
-    auto r_file_info_ptr = get_file_info_by_internal(internal_file_id);
-    if (r_file_info_ptr.is_error()) {
-      return;
-    }
-    auto &file_info = *r_file_info_ptr.ok();
-    remove_file(file_info.file_id, {}, false);
-  }
-
   void update_file_viewed(FileId file_id, FileSourceId file_source_id) final {
     if (unviewed_completed_download_ids_.empty() || !callback_ || !is_database_loaded_) {
       return;
     }
 
     LOG(INFO) << "File " << file_id << " was viewed from " << file_source_id;
-    auto r_file_info_ptr = get_file_info(file_id, file_source_id);
+    auto r_file_info_ptr = get_file_info_ptr(file_id, file_source_id);
     if (r_file_info_ptr.is_error()) {
       return;
     }
@@ -349,9 +326,9 @@ class DownloadManagerImpl final : public DownloadManager {
   struct FileInfo {
     int64 download_id{};
     FileId file_id;
-    FileId internal_file_id;
+    int64 internal_download_id{};
     FileSourceId file_source_id;
-    int8 priority;
+    int8 priority{};
     bool is_paused{};
     bool is_counted{};
     mutable bool is_registered{};
@@ -365,7 +342,6 @@ class DownloadManagerImpl final : public DownloadManager {
   };
 
   FlatHashMap<FileId, int64, FileIdHash> by_file_id_;
-  FlatHashMap<FileId, int64, FileIdHash> by_internal_file_id_;
   FlatHashMap<int64, unique_ptr<FileInfo>> files_;
   std::set<int64> completed_download_ids_;
   FlatHashSet<int64> unviewed_completed_download_ids_;
@@ -374,6 +350,7 @@ class DownloadManagerImpl final : public DownloadManager {
   Counters counters_;
   Counters sent_counters_;
   FileCounters file_counters_;
+  const char *database_loading_source_ = nullptr;
   bool is_inited_{false};
   bool is_database_loaded_{false};
   bool is_search_inited_{false};
@@ -394,7 +371,7 @@ class DownloadManagerImpl final : public DownloadManager {
   }
 
   static bool is_database_enabled() {
-    return G()->parameters().use_message_db;
+    return G()->use_message_database();
   }
 
   static string pmc_key(const FileInfo &file_info) {
@@ -411,7 +388,7 @@ class DownloadManagerImpl final : public DownloadManager {
       return;
     }
 
-    LOG(INFO) << "Saving to download database file " << file_info.file_id << '/' << file_info.internal_file_id
+    LOG(INFO) << "Saving to download database file " << file_info.file_id
               << " with is_paused = " << file_info.is_paused;
     FileDownloadInDatabase to_save;
     to_save.download_id = file_info.download_id;
@@ -446,7 +423,7 @@ class DownloadManagerImpl final : public DownloadManager {
           sent_counters_ = Counters();
         }
       }
-    } else {
+    } else if (!G()->td_db()->get_binlog_pmc()->get("dlds_counter").empty()) {
       G()->td_db()->get_binlog_pmc()->erase("dlds_counter");
       G()->td_db()->get_binlog_pmc()->erase_by_prefix("dlds#");
     }
@@ -464,6 +441,10 @@ class DownloadManagerImpl final : public DownloadManager {
       // file has already been added
       return;
     }
+    if (FileManager::check_priority(in_db.priority).is_error()) {
+      LOG(ERROR) << "Receive invalid download priority from database";
+      return;
+    }
 
     auto file_info = make_unique<FileInfo>();
     file_info->download_id = in_db.download_id;
@@ -477,7 +458,7 @@ class DownloadManagerImpl final : public DownloadManager {
     add_file_info(std::move(file_info), "");
   }
 
-  void load_database_files() {
+  void load_database_files(const char *source) {
     if (is_database_loaded_) {
       return;
     }
@@ -487,6 +468,8 @@ class DownloadManagerImpl final : public DownloadManager {
       return;
     }
     CHECK(is_inited_);
+    LOG_CHECK(database_loading_source_ == nullptr) << database_loading_source_ << ' ' << source;
+    database_loading_source_ = source;
 
     LOG(INFO) << "Start Download Manager database loading";
 
@@ -502,6 +485,7 @@ class DownloadManagerImpl final : public DownloadManager {
     }
 
     is_database_loaded_ = true;
+    database_loading_source_ = nullptr;
     update_counters();
     check_completed_downloads_size();
 
@@ -509,15 +493,15 @@ class DownloadManagerImpl final : public DownloadManager {
   }
 
   void prepare_hints() {
-    for (auto &it : files_) {
+    for (const auto &it : files_) {
       const auto &file_info = *it.second;
-      send_closure(G()->file_reference_manager(), &FileReferenceManager::get_file_search_text, file_info.file_source_id,
-                   callback_->get_file_view(file_info.file_id).get_unique_file_id(),
-                   [actor_id = actor_id(this), promise = load_search_text_multipromise_.get_promise(),
-                    download_id = it.first](Result<string> r_search_text) mutable {
-                     send_closure(actor_id, &DownloadManagerImpl::add_download_to_hints, download_id,
-                                  std::move(r_search_text), std::move(promise));
-                   });
+      auto promise =
+          PromiseCreator::lambda([actor_id = actor_id(this), promise = load_search_text_multipromise_.get_promise(),
+                                  download_id = it.first](Result<string> r_search_text) mutable {
+            send_closure(actor_id, &DownloadManagerImpl::add_download_to_hints, download_id, std::move(r_search_text),
+                         std::move(promise));
+          });
+      callback_->get_file_search_text(file_info.file_id, file_info.file_source_id, std::move(promise));
     }
   }
 
@@ -528,8 +512,8 @@ class DownloadManagerImpl final : public DownloadManager {
     }
 
     if (r_search_text.is_error()) {
-      if (!G()->close_flag()) {
-        remove_file(it->second->file_id, {}, false);
+      if (!G()->close_flag() && check_is_active("add_download_to_hints").is_ok()) {
+        remove_file_impl(*it->second, false, "add_download_to_hints");
       }
     } else {
       auto search_text = r_search_text.move_as_ok();
@@ -542,7 +526,7 @@ class DownloadManagerImpl final : public DownloadManager {
   void add_file_info(unique_ptr<FileInfo> &&file_info, const string &search_text) {
     CHECK(file_info != nullptr);
     auto download_id = file_info->download_id;
-    file_info->internal_file_id = callback_->dup_file_id(file_info->file_id);
+    file_info->internal_download_id = callback_->get_internal_download_id();
     auto file_view = callback_->get_sync_file_view(file_info->file_id);
     CHECK(!file_view.empty());
     file_info->size = file_view.size();
@@ -557,14 +541,12 @@ class DownloadManagerImpl final : public DownloadManager {
       return;
     }
 
-    by_internal_file_id_[file_info->internal_file_id] = download_id;
     by_file_id_[file_info->file_id] = download_id;
     hints_.add(download_id, search_text.empty() ? string(" ") : search_text);
     file_info->link_token = ++last_link_token_;
 
-    LOG(INFO) << "Adding to downloads file " << file_info->file_id << '/' << file_info->internal_file_id << " of size "
-              << file_info->size << '/' << file_info->expected_size
-              << " with downloaded_size = " << file_info->downloaded_size
+    LOG(INFO) << "Adding to downloads file " << file_info->file_id << " of size " << file_info->size << '/'
+              << file_info->expected_size << " with downloaded_size = " << file_info->downloaded_size
               << " and is_paused = " << file_info->is_paused;
     auto it = files_.emplace(download_id, std::move(file_info)).first;
     bool was_completed = is_completed(*it->second);
@@ -574,7 +556,7 @@ class DownloadManagerImpl final : public DownloadManager {
       CHECK(is_inserted == was_completed);
     } else {
       if (!it->second->is_paused) {
-        callback_->start_file(it->second->internal_file_id, it->second->priority,
+        callback_->start_file(it->second->file_id, it->second->internal_download_id, it->second->priority,
                               actor_shared(this, it->second->link_token));
       }
     }
@@ -582,6 +564,41 @@ class DownloadManagerImpl final : public DownloadManager {
       callback_->update_file_added(it->second->file_id, it->second->file_source_id, it->second->created_at,
                                    it->second->completed_at, it->second->is_paused, file_counters_);
     }
+  }
+
+  void remove_file_impl(const FileInfo &file_info, bool delete_from_cache, const char *source) {
+    auto file_id = file_info.file_id;
+    LOG(INFO) << "Remove from downloads file " << file_id << " from " << source;
+    auto download_id = file_info.download_id;
+    if (!is_completed(file_info) && !file_info.is_paused) {
+      callback_->pause_file(file_info.file_id, file_info.internal_download_id);
+    }
+    unregister_file_info(file_info);
+    if (delete_from_cache) {
+      callback_->delete_file(file_info.file_id);
+    }
+    by_file_id_.erase(file_id);
+    hints_.remove(download_id);
+    completed_download_ids_.erase(download_id);
+
+    remove_from_database(file_info);
+    files_.erase(download_id);
+    if (is_search_inited_) {
+      callback_->update_file_removed(file_id, file_counters_);
+    }
+
+    update_counters();
+    on_file_viewed(download_id);
+  }
+
+  Status remove_file_if_finished_impl(FileId file_id) {
+    TRY_STATUS(check_is_active("remove_file_if_finished_impl"));
+    TRY_RESULT(file_info_ptr, get_file_info_ptr(file_id));
+    if (!is_completed(*file_info_ptr)) {
+      return Status::Error("File is active");
+    }
+    remove_file_impl(*file_info_ptr, false, "remove_file_if_finished_impl");
+    return Status::OK();
   }
 
   void timeout_expired() final {
@@ -622,9 +639,10 @@ class DownloadManagerImpl final : public DownloadManager {
       file_info.link_token = ++last_link_token_;
     });
     if (is_paused) {
-      callback_->pause_file(file_info.internal_file_id);
+      callback_->pause_file(file_info.file_id, file_info.internal_download_id);
     } else {
-      callback_->start_file(file_info.internal_file_id, file_info.priority, actor_shared(this, file_info.link_token));
+      callback_->start_file(file_info.file_id, file_info.internal_download_id, file_info.priority,
+                            actor_shared(this, file_info.link_token));
     }
     if (is_search_inited_) {
       callback_->update_file_changed(file_info.file_id, file_info.completed_at, file_info.is_paused, file_counters_);
@@ -657,23 +675,15 @@ class DownloadManagerImpl final : public DownloadManager {
     callback_->update_counters(counters_);
   }
 
-  Result<const FileInfo *> get_file_info(FileId file_id, FileSourceId file_source_id = {}) {
+  Result<const FileInfo *> get_file_info_ptr(FileId file_id, FileSourceId file_source_id = {}) {
     auto it = by_file_id_.find(file_id);
     if (it == by_file_id_.end()) {
       return Status::Error(400, "Can't find file");
     }
-    return get_file_info(it->second, file_source_id);
+    return get_file_info_ptr(it->second, file_source_id);
   }
 
-  Result<const FileInfo *> get_file_info_by_internal(FileId file_id) {
-    auto it = by_internal_file_id_.find(file_id);
-    if (it == by_internal_file_id_.end()) {
-      return Status::Error(400, "Can't find file");
-    }
-    return get_file_info(it->second);
-  }
-
-  Result<const FileInfo *> get_file_info(int64 download_id, FileSourceId file_source_id = {}) {
+  Result<const FileInfo *> get_file_info_ptr(int64 download_id, FileSourceId file_source_id = {}) {
     auto it = files_.find(download_id);
     if (it == files_.end()) {
       return Status::Error(400, "Can't find file");
@@ -748,11 +758,15 @@ class DownloadManagerImpl final : public DownloadManager {
   }
 
   void check_completed_downloads_size() {
+    if (!is_database_loaded_ || check_is_active("check_completed_downloads_size").is_error()) {
+      return;
+    }
+
     constexpr size_t MAX_COMPLETED_DOWNLOADS = 200;
     while (completed_download_ids_.size() > MAX_COMPLETED_DOWNLOADS) {
       auto download_id = *completed_download_ids_.begin();
-      auto file_info = get_file_info(download_id).move_as_ok();
-      remove_file(file_info->file_id, FileSourceId(), false);
+      auto file_info_ptr = get_file_info_ptr(download_id).move_as_ok();
+      remove_file_impl(*file_info_ptr, false, "check_completed_downloads_size");
     }
   }
 
@@ -776,13 +790,13 @@ class DownloadManagerImpl final : public DownloadManager {
     register_file_info(file_info);
   }
 
-  Status check_is_active() {
+  Status check_is_active(const char *source) {
     if (!callback_) {
-      LOG(ERROR) << "DownloadManager is closed";
+      LOG(ERROR) << "DownloadManager is closed in " << source;
       return Status::Error(500, "DownloadManager is closed");
     }
     CHECK(is_inited_);
-    load_database_files();
+    load_database_files(source);
     return Status::OK();
   }
 };

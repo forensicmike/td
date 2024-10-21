@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,7 +10,6 @@
 #include "td/telegram/files/FileManager.h"
 #include "td/telegram/files/FileType.h"
 #include "td/telegram/Global.h"
-#include "td/telegram/TdParameters.h"
 
 #include "td/utils/algorithm.h"
 #include "td/utils/format.h"
@@ -30,7 +29,7 @@ int VERBOSITY_NAME(file_gc) = VERBOSITY_NAME(INFO);
 void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFileInfo> files,
                           Promise<FileGcResult> promise) {
   auto begin_time = Time::now();
-  VLOG(file_gc) << "Start files gc with " << parameters;
+  VLOG(file_gc) << "Start files GC with " << parameters;
   // quite stupid implementations
   // needs a lot of memory
   // may write something more clever, but i will need at least 2 passes over the files
@@ -38,7 +37,7 @@ void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFi
 
   std::array<bool, MAX_FILE_TYPE> immune_types{{false}};
 
-  if (G()->parameters().use_file_db) {
+  if (G()->use_file_database()) {
     // immune by default
     immune_types[narrow_cast<size_t>(FileType::Sticker)] = true;
     immune_types[narrow_cast<size_t>(FileType::ProfilePhoto)] = true;
@@ -61,7 +60,7 @@ void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFi
     }
   }
 
-  if (G()->parameters().use_file_db) {
+  if (G()->use_file_database()) {
     immune_types[narrow_cast<size_t>(FileType::EncryptedThumbnail)] = true;
   }
 
@@ -88,15 +87,14 @@ void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFi
   auto do_remove_file = [&removed_stats](const FullFileInfo &info) {
     removed_stats.add_copy(info);
     auto status = unlink(info.path);
-    LOG_IF(WARNING, status.is_error()) << "Failed to unlink file \"" << info.path << "\" during files gc: " << status;
+    LOG_IF(WARNING, status.is_error()) << "Failed to unlink file \"" << info.path << "\" during files GC: " << status;
     send_closure(G()->file_manager(), &FileManager::on_file_unlink,
                  FullLocalFileLocation(info.file_type, info.path, info.mtime_nsec));
   };
 
   double now = Clocks::system();
 
-  // Keep all immune files
-  // Remove all files with (atime > now - max_time_from_last_access)
+  // Remove all suitable files with (atime > now - max_time_from_last_access)
   td::remove_if(files, [&](const FullFileInfo &info) {
     if (token_) {
       return false;
@@ -117,7 +115,7 @@ void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFi
       return true;
     }
     if (static_cast<double>(info.mtime_nsec) * 1e-9 > now - parameters.immunity_delay_) {
-      // new files are immune to gc
+      // new files are immune to GC
       time_immunity_ignored_cnt++;
       new_stats.add_copy(info);
       return true;
@@ -177,7 +175,7 @@ void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFi
 
   auto end_time = Time::now();
 
-  VLOG(file_gc) << "Finish files gc: " << tag("time", end_time - begin_time) << tag("total", file_cnt)
+  VLOG(file_gc) << "Finish files GC: " << tag("time", end_time - begin_time) << tag("total", file_cnt)
                 << tag("removed", remove_by_atime_cnt + remove_by_count_cnt + remove_by_size_cnt)
                 << tag("total_size", format::as_size(total_size))
                 << tag("total_removed_size", format::as_size(total_removed_size))
@@ -186,6 +184,12 @@ void FileGcWorker::run_gc(const FileGcParameters &parameters, std::vector<FullFi
                 << tag("time_immunity", time_immunity_ignored_cnt)
                 << tag("owner_dialog_id_immunity", owner_dialog_id_ignored_cnt)
                 << tag("exclude_owner_dialog_id_immunity", exclude_owner_dialog_id_ignored_cnt);
+  if (end_time - begin_time > 1.0) {
+    LOG(WARNING) << "Finish file GC: " << tag("time", end_time - begin_time) << tag("total", file_cnt)
+                 << tag("removed", remove_by_atime_cnt + remove_by_count_cnt + remove_by_size_cnt)
+                 << tag("total_size", format::as_size(total_size))
+                 << tag("total_removed_size", format::as_size(total_removed_size));
+  }
 
   promise.set_value({std::move(new_stats), std::move(removed_stats)});
 }

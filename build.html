@@ -218,6 +218,7 @@
       <option>Clojure</option>
       <option>D</option>
       <option>Elixir</option>
+      <option>Vala</option>
       <option>C</option>
       <option>G</option>
       <option>Other</option>
@@ -239,6 +240,7 @@
       <option>Alpine</option>
       <option>CentOS 7</option>
       <option>CentOS 8</option>
+      <option>CentOS Stream 9</option>
       <option>Debian 8</option>
       <option>Debian 9</option>
       <option>Debian 10+</option>
@@ -246,6 +248,8 @@
       <option>Ubuntu 16</option>
       <option>Ubuntu 18</option>
       <option>Ubuntu 20</option>
+      <option>Ubuntu 22</option>
+      <option>Ubuntu 24</option>
       <option>Other</option>
     </select>
     <p></p>
@@ -314,7 +318,7 @@
     </div>
 
     <div id="buildRootDiv" class="hide">
-      <label><input type="checkbox" id="buildRootCheckbox" onchange="onOptionsChanged()"/>Build from root user (unrecommended)</label>
+      <label><input type="checkbox" id="buildRootCheckbox" onchange="onOptionsChanged()"/>Build from root user (not recommended)</label>
     </div>
 
     <p></p>
@@ -366,10 +370,10 @@ function getSupportedOs(language) {
     case 'C#':
       return ['Windows (through C++/CLI)', 'Universal Windows Platform (through C++/CX)', 'Windows (.NET Core)', 'Linux (.NET Core)', 'macOS (.NET Core)', 'FreeBSD (.NET Core)'];
     case 'Dart':
-      return ['Android', 'iOS', 'Windows', 'Linux', 'macOS', 'tvOS', 'watchOS'];
+      return ['Android', 'iOS', 'Windows', 'Linux', 'macOS', 'tvOS', 'visionOS', 'watchOS'];
     case 'Swift':
     case 'Objective-C':
-      return ['Windows', 'Linux', 'macOS', 'iOS', 'tvOS', 'watchOS'];
+      return ['Windows', 'Linux', 'macOS', 'iOS', 'tvOS', 'visionOS', 'watchOS'];
     default:
       return ['Windows', 'Linux', 'macOS', 'FreeBSD', 'OpenBSD', 'NetBSD'];
   }
@@ -396,6 +400,7 @@ function getExampleAnchor(language) {
     case 'Clojure':
     case 'D':
     case 'Elixir':
+    case 'Vala':
     case 'C':
     case 'G':
       return language.toLowerCase();
@@ -469,9 +474,12 @@ function getTarget(language, os) {
     return 'WebAssembly';
   }
   if (os.includes('Android')) {
+    if (language === 'Dart') {
+      return 'AndroidJson';
+    }
     return 'Android';
   }
-  if (os.includes('iOS') || os.includes('tvOS') || os.includes('watchOS')) {
+  if (os.includes('iOS') || os.includes('tvOS') || os.includes('visionOS') || os.includes('watchOS')) {
     return 'iOS';
   }
 
@@ -491,9 +499,10 @@ function getTargetName(target) {
     case 'tdjson':
     case 'WebAssembly':
     case 'iOS':
+    case 'AndroidJson':
       return '<a href="https://github.com/tdlib/td#using-json">JSON</a>';
     case 'tdclient':
-      return '<a href="https://github.com/tdlib/td#using-cxx">a simple and convenient C++11-interface</a>';
+      return '<a href="https://github.com/tdlib/td#using-cxx">simple and convenient C++11</a>';
     case 'JNI':
     case 'Android':
       return '<a href="https://github.com/tdlib/td#using-java">native ' + target + '</a>';
@@ -520,9 +529,9 @@ function onOsChanged() {
            'If you want to build it manually, take a look at our <a href="https://github.com/tdlib/td/tree/master/example/web">example</a>.';
     target = '';
   }
-  if (target === 'Android') {
-    text = 'TDLib for Android is available in a prebuilt form and can be downloaded from <a href="https://core.telegram.org/tdlib/tdlib.zip">there</a>.<br>' +
-           'See <a href="https://github.com/tdlib/td/issues/77#issuecomment-640719893">build instructions</a> if you want to build the latest TDLib version or want to build TDLib with different interface.';
+  if (target === 'Android' || target === 'AndroidJson') {
+    text = 'TDLib can be used from ' + language + ' on ' + os + ' through the ' + getTargetName(target) + ' interface.<br>' +
+           'See <a href="https://github.com/tdlib/td/blob/master/example/android">Android example</a> for the example of building TDLib for Android.<br>';
     target = '';
   }
   if (target === 'iOS') {
@@ -586,8 +595,8 @@ function onOptionsChanged() {
   var low_memory = false;
   if (os_linux || os_freebsd || os_netbsd) {
     low_memory = document.getElementById('buildLowMemoryCheckbox').checked;
-    document.getElementById('buildLowMemoryText').innerHTML = 'I have less than ' + (use_clang ? '1.5' : '3.5') +' GB of RAM.' +
-            (low_memory ? ' Now you will need only ' + (use_clang ? '0.5' : '1') +' GB of RAM to build TDLib.' : '');
+    document.getElementById('buildLowMemoryText').innerHTML = 'I have less than ' + (use_clang ? '2' : '4') +' GB of RAM.' +
+            (low_memory ? ' Now you will need only ' + (use_clang ? '0.8' : '1.5') +' GB of RAM to build TDLib.' : '');
     document.getElementById('buildLowMemoryDiv').style.display = 'block';
   } else {
     if (os_openbsd) {
@@ -638,7 +647,7 @@ function onOptionsChanged() {
   var use_vcpkg = os_windows;
 
   var use_lto = false;
-  if (!use_msvc && language !== 'Java' && language !== 'Kotlin' && (os_mac || (os_linux && (linux_distro === 'Ubuntu 18' || linux_distro === 'Ubuntu 20' || linux_distro === 'Other')))) {
+  if (!use_msvc && language !== 'Go' && language !== 'Java' && language !== 'Kotlin' && (os_mac || (os_linux && (linux_distro === 'Ubuntu 18' || linux_distro === 'Ubuntu 20' || linux_distro === 'Ubuntu 22' || linux_distro === 'Ubuntu 24' || linux_distro === 'Other')))) {
     document.getElementById('buildLtoDiv').style.display = 'block';
     use_lto = document.getElementById('buildLtoCheckbox').checked;
   } else {
@@ -706,7 +715,7 @@ function onOptionsChanged() {
     pre_text.push('Download and install <a href="https://visualstudio.microsoft.com/vs/community/">Microsoft Visual Studio</a>. Enable C++' + win10_sdk + ' support while installing.');
     pre_text.push('Download and install <a href="https://cmake.org/download/">CMake</a>; choose "Add CMake to the system PATH" option while installing.');
     pre_text.push('Download and install <a href="https://git-scm.com/download/win">Git</a>.');
-    pre_text.push('Download and unpack <a href="https://windows.php.net/download#php-7.2">PHP</a>. Add the path to php.exe to the PATH environment variable.');
+    pre_text.push('Download and unpack <a href="https://windows.php.net/download">PHP</a>. Add the path to php.exe to the PATH environment variable.');
     if (target === 'C++/CX') {
       switch (archiver) {
         case '7zip':
@@ -725,7 +734,7 @@ function onOptionsChanged() {
     if (os_windows) {
       pre_text.push('Download and install <a href="https://www.oracle.com/technetwork/java/javase/downloads/index.html">JDK</a>.');
     } else if (os_linux && linux_distro === 'Alpine') {
-      pre_text.push('Add community repository for your Alpine version (not edge) in /etc/apk/repositories. For example, you can do it through vim, preliminary installing it via "apk add --update vim".');
+      pre_text.push('Add community repository for your Alpine version (not edge) in /etc/apk/repositories. For example, you can do it through vim, preliminary installing it via "apk add vim".');
     }
   }
   if (os_linux && linux_distro === 'Other') {
@@ -737,7 +746,7 @@ function onOptionsChanged() {
     pre_text.push('Note that for Node.js &ge; 17 you must build TDLib with OpenSSL 3.0.*, for Node.js &ge; 10 with OpenSSL 1.1.*, and for Node.js &lt; 10 with OpenSSL 1.0.*, so you may need to modify the following commands to install a proper OpenSSL version.');
   }
   if (os_freebsd) {
-    pre_text.push('Note that the following instruction is for FreeBSD 11.');
+    pre_text.push('Note that the following instruction is for FreeBSD 13.');
     pre_text.push('Note that the following calls to <code>pkg</code> needs to be run as <code>root</code>.');
   }
   if (os_openbsd) {
@@ -745,7 +754,7 @@ function onOptionsChanged() {
     pre_text.push('Note that building requires a lot of memory, so you may need to increase allowed per-process memory usage in /etc/login.conf or build from root.');
   }
   if (os_netbsd) {
-    pre_text.push('Note that the following instruction is for NetBSD 8.0 and default SH shell.');
+    pre_text.push('Note that the following instruction is for NetBSD 8+ and default SH shell.');
   }
   if (os_mac) {
     pre_text.push('Note that the following instruction will build TDLib only for ' + os_mac_host_name + '.');
@@ -797,6 +806,21 @@ function onOptionsChanged() {
         return '-6.0';
       case 'Ubuntu 20':
         return '-10';
+      case 'Ubuntu 22':
+        return '-14';
+      case 'Ubuntu 24':
+        return '-18';
+      default:
+        return ''; // use default version
+    }
+  }
+
+  function getLibcplusplusVersionSuffix() {
+    switch (linux_distro) {
+      case 'Ubuntu 20':
+      case 'Ubuntu 22':
+      case 'Ubuntu 24':
+        return getClangVersionSuffix();
       default:
         return ''; // use default version
     }
@@ -822,25 +846,32 @@ function onOptionsChanged() {
         if (target === 'JNI') {
           packages += ' openjdk8';
         }
-        commands.push(sudo + 'apk add --update ' + packages);
+        commands.push(sudo + 'apk add ' + packages);
         break;
       case 'CentOS 7':
-      case 'CentOS 8':
         commands.push(sudo + 'yum update -y');
-        var packages = 'gcc-c++ make git zlib-devel openssl-devel php';
-        if (linux_distro === 'CentOS 7') {
-          commands.push(sudo + 'yum install -y centos-release-scl-rh epel-release');
-          commands.push(sudo + 'yum install -y devtoolset-9-gcc devtoolset-9-gcc-c++');
-          cmake = 'cmake3';
-          packages += ' gperf';
-        } else {
-          commands.push(sudo + 'dnf --enablerepo=powertools install gperf');
-        }
-        packages += ' ' + cmake;
+        commands.push(sudo + 'yum install -y centos-release-scl-rh epel-release');
+        commands.push(sudo + 'yum install -y devtoolset-9-gcc devtoolset-9-gcc-c++');
+        var packages = 'gcc-c++ make git zlib-devel openssl-devel php gperf cmake3';
         if (target === 'JNI') {
           packages += ' java-11-openjdk-devel';
         }
+        cmake = 'cmake3';
         commands.push(sudo + 'yum install -y ' + packages);
+        break;
+      case 'CentOS 8':
+      case 'CentOS Stream 9':
+        commands.push(sudo + 'dnf update -y');
+        if (linux_distro === 'CentOS 8') {
+          commands.push(sudo + 'dnf --enablerepo=powertools install -y gperf');
+        } else {
+          commands.push(sudo + 'dnf --enablerepo=crb install -y gperf');
+        }
+        var packages = 'gcc-c++ make git zlib-devel openssl-devel php cmake';
+        if (target === 'JNI') {
+          packages += ' java-11-openjdk-devel';
+        }
+        commands.push(sudo + 'dnf install -y ' + packages);
         break;
       case 'Debian 8':
       case 'Debian 9':
@@ -849,6 +880,8 @@ function onOptionsChanged() {
       case 'Ubuntu 16':
       case 'Ubuntu 18':
       case 'Ubuntu 20':
+      case 'Ubuntu 22':
+      case 'Ubuntu 24':
         if (linux_distro.includes('Debian') && !use_root) {
           commands.push('su -');
         }
@@ -872,9 +905,9 @@ function onOptionsChanged() {
           packages += ' default-jdk';
         }
         if (use_clang) {
-          packages += ' clang' + getClangVersionSuffix() + ' libc++-dev';
-          if (linux_distro === 'Debian 10+' || linux_distro === 'Ubuntu 18' || linux_distro === 'Ubuntu 20') {
-            packages += ' libc++abi-dev';
+          packages += ' clang' + getClangVersionSuffix() + ' libc++' + getLibcplusplusVersionSuffix() + '-dev';
+          if (linux_distro === 'Debian 10+' || linux_distro === 'Ubuntu 18' || linux_distro === 'Ubuntu 20' || linux_distro === 'Ubuntu 22' || linux_distro === 'Ubuntu 24') {
+            packages += ' libc++abi' + getLibcplusplusVersionSuffix() + '-dev';
           }
         } else {
           packages += ' g++';
@@ -890,9 +923,9 @@ function onOptionsChanged() {
     }
   } else if (os_freebsd) {
     commands.push(sudo + 'pkg upgrade');
-    var packages = 'git gperf php72 cmake';
+    var packages = 'git gperf php83 cmake';
     if (target === 'JNI') {
-      packages += ' openjdk';
+      packages += ' openjdk21';
     }
     commands.push(sudo + 'pkg install ' + packages);
   } else if (os_openbsd) {
@@ -913,8 +946,8 @@ function onOptionsChanged() {
     if (!use_root) {
       commands.push('su -');
     }
-    commands.push('export PKG_PATH=ftp://ftp.netbsd.org/pub/pkgsrc/packages/NetBSD/i386/8.0_2019Q2/All');
-    var packages = 'git gperf php-7.3.6 cmake openssl gcc5-libs';
+    commands.push('export PKG_PATH=http://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/$(uname -p)/$(uname -r)/All');
+    var packages = 'git gperf pcre2 php-8* cmake openssl gcc12-libs mozilla-rootcerts-openssl';
     commands.push('pkg_add ' + packages);
     if (!use_root) {
       commands.push('exit');
@@ -928,6 +961,7 @@ function onOptionsChanged() {
   if (use_vcpkg) {
     commands.push('git clone https://github.com/Microsoft/vcpkg.git');
     commands.push('cd vcpkg');
+    commands.push('git checkout cd5e746ec203c8c3c61647e0886a8df8c1e78e41');
     commands.push(local + 'bootstrap-vcpkg.bat');
     if (target === 'C++/CX') {
       commands.push(local + 'vcpkg.exe install gperf:x86-windows openssl:arm-uwp openssl:arm64-uwp openssl:x64-uwp openssl:x86-uwp zlib:arm-uwp zlib:arm64-uwp zlib:x64-uwp zlib:x86-uwp');

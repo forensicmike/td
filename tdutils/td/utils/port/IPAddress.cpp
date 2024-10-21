@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -53,7 +53,7 @@ static void punycode(string &result, Slice part) {
   auto end = part.uend();
   while (begin != end) {
     uint32 code;
-    begin = next_utf8_unsafe(begin, &code, "punycode");
+    begin = next_utf8_unsafe(begin, &code);
     if (code <= 127u) {
       result += to_lower(static_cast<char>(code));
       processed++;

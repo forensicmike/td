@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -11,11 +11,12 @@
 #include "td/telegram/telegram_api.h"
 
 #include "td/actor/actor.h"
-#include "td/actor/PromiseFuture.h"
 
 #include "td/utils/common.h"
 #include "td/utils/Container.h"
 #include "td/utils/FlatHashMap.h"
+#include "td/utils/HashTableUtils.h"
+#include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Status.h"
 
@@ -29,8 +30,7 @@ class SqliteKeyValue;
 
 class LanguagePackManager final : public NetQueryCallback {
  public:
-  explicit LanguagePackManager(ActorShared<> parent) : parent_(std::move(parent)) {
-  }
+  explicit LanguagePackManager(ActorShared<> parent);
   LanguagePackManager(const LanguagePackManager &) = delete;
   LanguagePackManager &operator=(const LanguagePackManager &) = delete;
   LanguagePackManager(LanguagePackManager &&) = delete;
@@ -106,7 +106,7 @@ class LanguagePackManager final : public NetQueryCallback {
   static int32 manager_count_;
 
   static std::mutex language_database_mutex_;
-  static std::unordered_map<string, unique_ptr<LanguageDatabase>> language_databases_;
+  static std::unordered_map<string, unique_ptr<LanguageDatabase>, Hash<string>> language_databases_;
 
   static LanguageDatabase *add_language_database(string path);
 

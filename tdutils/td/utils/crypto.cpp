@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,6 +10,7 @@
 #include "td/utils/BigNum.h"
 #include "td/utils/bits.h"
 #include "td/utils/common.h"
+#include "td/utils/Destructor.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/port/RwMutex.h"
@@ -318,34 +319,74 @@ class Evp {
     ctx_ = EVP_CIPHER_CTX_new();
     LOG_IF(FATAL, ctx_ == nullptr);
   }
-  Evp(const Evp &from) = delete;
-  Evp &operator=(const Evp &from) = delete;
-  Evp(Evp &&from) = delete;
-  Evp &operator=(Evp &&from) = delete;
+  Evp(const Evp &) = delete;
+  Evp &operator=(const Evp &) = delete;
+  Evp(Evp &&) = delete;
+  Evp &operator=(Evp &&) = delete;
   ~Evp() {
     CHECK(ctx_ != nullptr);
     EVP_CIPHER_CTX_free(ctx_);
   }
 
   void init_encrypt_ecb(Slice key) {
-    init(Type::Ecb, true, EVP_aes_256_ecb(), key);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    static TD_THREAD_LOCAL const EVP_CIPHER *evp_cipher;
+    if (unlikely(evp_cipher == nullptr)) {
+      init_thread_local_evp_cipher(evp_cipher, "AES-256-ECB");
+    }
+#else
+    const EVP_CIPHER *evp_cipher = EVP_aes_256_ecb();
+#endif
+    init(true, evp_cipher, key);
   }
 
   void init_decrypt_ecb(Slice key) {
-    init(Type::Ecb, false, EVP_aes_256_ecb(), key);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    static TD_THREAD_LOCAL const EVP_CIPHER *evp_cipher;
+    if (unlikely(evp_cipher == nullptr)) {
+      init_thread_local_evp_cipher(evp_cipher, "AES-256-ECB");
+    }
+#else
+    const EVP_CIPHER *evp_cipher = EVP_aes_256_ecb();
+#endif
+    init(false, evp_cipher, key);
   }
 
   void init_encrypt_cbc(Slice key) {
-    init(Type::Cbc, true, EVP_aes_256_cbc(), key);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    static TD_THREAD_LOCAL const EVP_CIPHER *evp_cipher;
+    if (unlikely(evp_cipher == nullptr)) {
+      init_thread_local_evp_cipher(evp_cipher, "AES-256-CBC");
+    }
+#else
+    const EVP_CIPHER *evp_cipher = EVP_aes_256_cbc();
+#endif
+    init(true, evp_cipher, key);
   }
 
   void init_decrypt_cbc(Slice key) {
-    init(Type::Cbc, false, EVP_aes_256_cbc(), key);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    static TD_THREAD_LOCAL const EVP_CIPHER *evp_cipher;
+    if (unlikely(evp_cipher == nullptr)) {
+      init_thread_local_evp_cipher(evp_cipher, "AES-256-CBC");
+    }
+#else
+    const EVP_CIPHER *evp_cipher = EVP_aes_256_cbc();
+#endif
+    init(false, evp_cipher, key);
   }
 
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
   void init_encrypt_ctr(Slice key) {
-    init(Type::Ctr, true, EVP_aes_256_ctr(), key);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+    static TD_THREAD_LOCAL const EVP_CIPHER *evp_cipher;
+    if (unlikely(evp_cipher == nullptr)) {
+      init_thread_local_evp_cipher(evp_cipher, "AES-256-CTR");
+    }
+#else
+    const EVP_CIPHER *evp_cipher = EVP_aes_256_ctr();
+#endif
+    init(true, evp_cipher, key);
   }
 #endif
 
@@ -355,8 +396,6 @@ class Evp {
   }
 
   void encrypt(const uint8 *src, uint8 *dst, int size) {
-    // CHECK(type_ != Type::Empty && is_encrypt_);
-    // CHECK(size % AES_BLOCK_SIZE == 0);
     int len;
     int res = EVP_EncryptUpdate(ctx_, dst, &len, src, size);
     LOG_IF(FATAL, res != 1);
@@ -364,7 +403,6 @@ class Evp {
   }
 
   void decrypt(const uint8 *src, uint8 *dst, int size) {
-    // CHECK(type_ != Type::Empty && !is_encrypt_);
     CHECK(size % AES_BLOCK_SIZE == 0);
     int len;
     int res = EVP_DecryptUpdate(ctx_, dst, &len, src, size);
@@ -374,17 +412,23 @@ class Evp {
 
  private:
   EVP_CIPHER_CTX *ctx_{nullptr};
-  enum class Type : int8 { Empty, Ecb, Cbc, Ctr };
-  // Type type_{Type::Empty};
-  // bool is_encrypt_ = false;
 
-  void init(Type type, bool is_encrypt, const EVP_CIPHER *cipher, Slice key) {
-    // type_ = type;
-    // is_encrypt_ = is_encrypt;
-    int res = EVP_CipherInit_ex(ctx_, cipher, nullptr, key.ubegin(), nullptr, is_encrypt ? 1 : 0);
+  void init(bool is_encrypt, const EVP_CIPHER *evp_cipher, Slice key) {
+    int res = EVP_CipherInit_ex(ctx_, evp_cipher, nullptr, key.ubegin(), nullptr, is_encrypt ? 1 : 0);
     LOG_IF(FATAL, res != 1);
     EVP_CIPHER_CTX_set_padding(ctx_, 0);
   }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+  static void init_thread_local_evp_cipher(const EVP_CIPHER *&evp_cipher, const char *algorithm) {
+    evp_cipher = EVP_CIPHER_fetch(nullptr, algorithm, nullptr);
+    LOG_IF(FATAL, evp_cipher == nullptr);
+    detail::add_thread_local_destructor(create_destructor([&evp_cipher]() mutable {
+      EVP_CIPHER_free(const_cast<EVP_CIPHER *>(evp_cipher));
+      evp_cipher = nullptr;
+    }));
+  }
+#endif
 };
 
 struct AesState::Impl {
@@ -392,8 +436,8 @@ struct AesState::Impl {
 };
 
 AesState::AesState() = default;
-AesState::AesState(AesState &&from) noexcept = default;
-AesState &AesState::operator=(AesState &&from) noexcept = default;
+AesState::AesState(AesState &&) noexcept = default;
+AesState &AesState::operator=(AesState &&) noexcept = default;
 AesState::~AesState() = default;
 
 void AesState::init(Slice key, bool encrypt) {
@@ -511,8 +555,8 @@ class AesIgeStateImpl {
 };
 
 AesIgeState::AesIgeState() = default;
-AesIgeState::AesIgeState(AesIgeState &&from) noexcept = default;
-AesIgeState &AesIgeState::operator=(AesIgeState &&from) noexcept = default;
+AesIgeState::AesIgeState(AesIgeState &&) noexcept = default;
+AesIgeState &AesIgeState::operator=(AesIgeState &&) noexcept = default;
 AesIgeState::~AesIgeState() = default;
 
 void AesIgeState::init(Slice key, Slice iv, bool encrypt) {
@@ -576,8 +620,8 @@ AesCbcState::AesCbcState(Slice key256, Slice iv128) : raw_{SecureString(key256),
   CHECK(raw_.iv.size() == 16);
 }
 
-AesCbcState::AesCbcState(AesCbcState &&from) noexcept = default;
-AesCbcState &AesCbcState::operator=(AesCbcState &&from) noexcept = default;
+AesCbcState::AesCbcState(AesCbcState &&) noexcept = default;
+AesCbcState &AesCbcState::operator=(AesCbcState &&) noexcept = default;
 AesCbcState::~AesCbcState() = default;
 
 void AesCbcState::encrypt(Slice from, MutableSlice to) {
@@ -630,8 +674,8 @@ struct AesCtrState::Impl {
 };
 
 AesCtrState::AesCtrState() = default;
-AesCtrState::AesCtrState(AesCtrState &&from) noexcept = default;
-AesCtrState &AesCtrState::operator=(AesCtrState &&from) noexcept = default;
+AesCtrState::AesCtrState(AesCtrState &&) noexcept = default;
+AesCtrState &AesCtrState::operator=(AesCtrState &&) noexcept = default;
 AesCtrState::~AesCtrState() = default;
 
 void AesCtrState::init(Slice key, Slice iv) {
@@ -677,22 +721,46 @@ void AesCtrState::decrypt(Slice from, MutableSlice to) {
 }
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-static void make_digest(Slice data, MutableSlice output, const EVP_MD *evp_md) {
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  LOG_IF(FATAL, ctx == nullptr);
-  int res = EVP_DigestInit_ex(ctx, evp_md, nullptr);
+static void make_digest(Slice data, MutableSlice output, const EVP_MD_CTX *evp_md_ctx) {
+  static TD_THREAD_LOCAL EVP_MD_CTX *ctx;
+  if (unlikely(ctx == nullptr)) {
+    ctx = EVP_MD_CTX_new();
+    LOG_IF(FATAL, ctx == nullptr);
+    detail::add_thread_local_destructor(create_destructor([] {
+      EVP_MD_CTX_free(ctx);
+      ctx = nullptr;
+    }));
+  }
+  int res = EVP_MD_CTX_copy_ex(ctx, evp_md_ctx);
   LOG_IF(FATAL, res != 1);
   res = EVP_DigestUpdate(ctx, data.ubegin(), data.size());
   LOG_IF(FATAL, res != 1);
   res = EVP_DigestFinal_ex(ctx, output.ubegin(), nullptr);
   LOG_IF(FATAL, res != 1);
-  EVP_MD_CTX_free(ctx);
+  EVP_MD_CTX_reset(ctx);
+}
+
+static void init_thread_local_evp_md_ctx(const EVP_MD_CTX *&evp_md_ctx, const char *algorithm) {
+  EVP_MD *evp_md = EVP_MD_fetch(nullptr, algorithm, nullptr);
+  LOG_IF(FATAL, evp_md == nullptr);
+  evp_md_ctx = EVP_MD_CTX_new();
+  int res = EVP_DigestInit_ex(const_cast<EVP_MD_CTX *>(evp_md_ctx), evp_md, nullptr);
+  LOG_IF(FATAL, res != 1);
+  EVP_MD_free(evp_md);
+  detail::add_thread_local_destructor(create_destructor([&evp_md_ctx]() mutable {
+    EVP_MD_CTX_free(const_cast<EVP_MD_CTX *>(evp_md_ctx));
+    evp_md_ctx = nullptr;
+  }));
 }
 #endif
 
 void sha1(Slice data, unsigned char output[20]) {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-  make_digest(data, MutableSlice(output, 20), EVP_sha1());
+  static TD_THREAD_LOCAL const EVP_MD_CTX *evp_md_ctx;
+  if (unlikely(evp_md_ctx == nullptr)) {
+    init_thread_local_evp_md_ctx(evp_md_ctx, "sha1");
+  }
+  make_digest(data, MutableSlice(output, 20), evp_md_ctx);
 #else
   auto result = SHA1(data.ubegin(), data.size(), output);
   CHECK(result == output);
@@ -702,7 +770,11 @@ void sha1(Slice data, unsigned char output[20]) {
 void sha256(Slice data, MutableSlice output) {
   CHECK(output.size() >= 32);
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-  make_digest(data, output, EVP_sha256());
+  static TD_THREAD_LOCAL const EVP_MD_CTX *evp_md_ctx;
+  if (unlikely(evp_md_ctx == nullptr)) {
+    init_thread_local_evp_md_ctx(evp_md_ctx, "sha256");
+  }
+  make_digest(data, output, evp_md_ctx);
 #else
   auto result = SHA256(data.ubegin(), data.size(), output.ubegin());
   CHECK(result == output.ubegin());
@@ -712,7 +784,11 @@ void sha256(Slice data, MutableSlice output) {
 void sha512(Slice data, MutableSlice output) {
   CHECK(output.size() >= 64);
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-  make_digest(data, output, EVP_sha512());
+  static TD_THREAD_LOCAL const EVP_MD_CTX *evp_md_ctx;
+  if (unlikely(evp_md_ctx == nullptr)) {
+    init_thread_local_evp_md_ctx(evp_md_ctx, "sha512");
+  }
+  make_digest(data, output, evp_md_ctx);
 #else
   auto result = SHA512(data.ubegin(), data.size(), output.ubegin());
   CHECK(result == output.ubegin());
@@ -756,10 +832,10 @@ class Sha256State::Impl {
   ~Impl() = default;
 #endif
 
-  Impl(const Impl &from) = delete;
-  Impl &operator=(const Impl &from) = delete;
-  Impl(Impl &&from) = delete;
-  Impl &operator=(Impl &&from) = delete;
+  Impl(const Impl &) = delete;
+  Impl &operator=(const Impl &) = delete;
+  Impl(Impl &&) = delete;
+  Impl &operator=(Impl &&) = delete;
 };
 
 Sha256State::Sha256State() = default;
@@ -792,7 +868,11 @@ void Sha256State::init() {
   }
   CHECK(!is_inited_);
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-  int err = EVP_DigestInit_ex(impl_->ctx_, EVP_sha256(), nullptr);
+  static TD_THREAD_LOCAL const EVP_MD_CTX *evp_md_ctx;
+  if (unlikely(evp_md_ctx == nullptr)) {
+    init_thread_local_evp_md_ctx(evp_md_ctx, "sha256");
+  }
+  int err = EVP_MD_CTX_copy_ex(impl_->ctx_, evp_md_ctx);
 #else
   int err = SHA256_Init(&impl_->ctx_);
 #endif
@@ -830,7 +910,11 @@ void Sha256State::extract(MutableSlice output, bool destroy) {
 void md5(Slice input, MutableSlice output) {
   CHECK(output.size() >= 16);
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-  make_digest(input, output, EVP_md5());
+  static TD_THREAD_LOCAL const EVP_MD_CTX *evp_md_ctx;
+  if (unlikely(evp_md_ctx == nullptr)) {
+    init_thread_local_evp_md_ctx(evp_md_ctx, "md5");
+  }
+  make_digest(input, output, evp_md_ctx);
 #else
   auto result = MD5(input.ubegin(), input.size(), output.ubegin());
   CHECK(result == output.ubegin());
@@ -963,7 +1047,7 @@ Result<BufferSlice> rsa_encrypt_pkcs1_oaep(Slice public_key, Slice data) {
   int outlen = RSA_size(rsa);
   BufferSlice res(outlen);
   if (RSA_public_encrypt(narrow_cast<int>(data.size()), const_cast<unsigned char *>(data.ubegin()),
-                         res.as_slice().ubegin(), rsa, RSA_PKCS1_OAEP_PADDING) != outlen) {
+                         res.as_mutable_slice().ubegin(), rsa, RSA_PKCS1_OAEP_PADDING) != outlen) {
 #else
   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, nullptr);
   if (!ctx) {
@@ -985,7 +1069,7 @@ Result<BufferSlice> rsa_encrypt_pkcs1_oaep(Slice public_key, Slice data) {
     return Status::Error("Cannot calculate encrypted length");
   }
   BufferSlice res(outlen);
-  if (EVP_PKEY_encrypt(ctx, res.as_slice().ubegin(), &outlen, data.ubegin(), data.size()) <= 0) {
+  if (EVP_PKEY_encrypt(ctx, res.as_mutable_slice().ubegin(), &outlen, data.ubegin(), data.size()) <= 0) {
 #endif
     return Status::Error("Cannot encrypt");
   }
@@ -1015,7 +1099,7 @@ Result<BufferSlice> rsa_decrypt_pkcs1_oaep(Slice private_key, Slice data) {
   size_t outlen = RSA_size(rsa);
   BufferSlice res(outlen);
   auto inlen = RSA_private_decrypt(narrow_cast<int>(data.size()), const_cast<unsigned char *>(data.ubegin()),
-                                   res.as_slice().ubegin(), rsa, RSA_PKCS1_OAEP_PADDING);
+                                   res.as_mutable_slice().ubegin(), rsa, RSA_PKCS1_OAEP_PADDING);
   if (inlen == -1) {
     return Status::Error("Cannot decrypt");
   }
@@ -1041,7 +1125,7 @@ Result<BufferSlice> rsa_decrypt_pkcs1_oaep(Slice private_key, Slice data) {
     return Status::Error("Cannot calculate decrypted length");
   }
   BufferSlice res(outlen);
-  if (EVP_PKEY_decrypt(ctx, res.as_slice().ubegin(), &outlen, data.ubegin(), data.size()) <= 0) {
+  if (EVP_PKEY_decrypt(ctx, res.as_mutable_slice().ubegin(), &outlen, data.ubegin(), data.size()) <= 0) {
     return Status::Error("Cannot decrypt");
   }
 #endif
@@ -1113,7 +1197,10 @@ Status create_openssl_error(int code, Slice message) {
 
 void clear_openssl_errors(Slice source) {
   if (ERR_peek_error() != 0) {
-    LOG(ERROR) << source << ": " << create_openssl_error(0, "Unprocessed OPENSSL_ERROR");
+    auto error = create_openssl_error(0, "Unprocessed OPENSSL_ERROR");
+    if (!ends_with(error.message(), ":def_load:system lib}")) {
+      LOG(ERROR) << source << ": " << error;
+    }
   }
 #if TD_PORT_WINDOWS
   WSASetLastError(0);

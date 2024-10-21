@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -9,6 +9,7 @@
 #include "td/utils/FlatHashMap.h"
 #include "td/utils/FlatHashMapChunks.h"
 #include "td/utils/FlatHashSet.h"
+#include "td/utils/HashTableUtils.h"
 #include "td/utils/logging.h"
 #include "td/utils/Random.h"
 #include "td/utils/Slice.h"
@@ -16,7 +17,6 @@
 
 #include <algorithm>
 #include <array>
-#include <functional>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
@@ -83,13 +83,27 @@ struct A {
 };
 
 struct AHash {
-  std::size_t operator()(A a) const {
-    return std::hash<int>()(a.a);
+  td::uint32 operator()(A a) const {
+    return td::Hash<int>()(a.a);
   }
 };
 
 static bool operator==(const A &lhs, const A &rhs) {
   return lhs.a == rhs.a;
+}
+
+TEST(FlatHashSet, init) {
+  td::FlatHashSet<td::Slice, td::SliceHash> s{"1", "22", "333", "4444"};
+  ASSERT_TRUE(s.size() == 4);
+  td::string str("1");
+  ASSERT_TRUE(s.count(str) == 1);
+  ASSERT_TRUE(s.count("1") == 1);
+  ASSERT_TRUE(s.count("22") == 1);
+  ASSERT_TRUE(s.count("333") == 1);
+  ASSERT_TRUE(s.count("4444") == 1);
+  ASSERT_TRUE(s.count("4") == 0);
+  ASSERT_TRUE(s.count("222") == 0);
+  ASSERT_TRUE(s.count("") == 0);
 }
 
 TEST(FlatHashSet, foreach) {
@@ -112,7 +126,7 @@ TEST(FlatHashSet, TL) {
 
 TEST(FlatHashMap, basic) {
   {
-    td::FlatHashMap<int, int> map;
+    td::FlatHashMap<td::int32, int> map;
     map[1] = 2;
     ASSERT_EQ(2, map[1]);
     ASSERT_EQ(1, map.find(1)->first);
@@ -124,16 +138,15 @@ TEST(FlatHashMap, basic) {
       ASSERT_EQ(2, kv.second);
     }
     map.erase(map.find(1));
-    auto map_copy = map;
   }
 
-  td::FlatHashMap<int, std::array<td::unique_ptr<td::string>, 10>> x;
+  td::FlatHashMap<td::int32, std::array<td::unique_ptr<td::string>, 10>> x;
   auto y = std::move(x);
   x[12];
   x.erase(x.find(12));
 
   {
-    td::FlatHashMap<int, td::string> map = {{1, "hello"}, {2, "world"}};
+    td::FlatHashMap<td::int32, td::string> map = {{1, "hello"}, {2, "world"}};
     ASSERT_EQ("hello", map[1]);
     ASSERT_EQ("world", map[2]);
     ASSERT_EQ(2u, map.size());
@@ -142,7 +155,7 @@ TEST(FlatHashMap, basic) {
   }
 
   {
-    td::FlatHashMap<int, td::string> map = {{1, "hello"}, {1, "world"}};
+    td::FlatHashMap<td::int32, td::string> map = {{1, "hello"}, {1, "world"}};
     ASSERT_EQ("hello", map[1]);
     ASSERT_EQ(1u, map.size());
   }
@@ -159,19 +172,12 @@ TEST(FlatHashMap, basic) {
     }
     ASSERT_EQ(data, extract_kv(kv));
 
-    KV copied_kv(kv);
-    ASSERT_EQ(data, extract_kv(copied_kv));
-
     KV moved_kv(std::move(kv));
     ASSERT_EQ(data, extract_kv(moved_kv));
     ASSERT_EQ(Data{}, extract_kv(kv));
     ASSERT_TRUE(kv.empty());
     kv = std::move(moved_kv);
     ASSERT_EQ(data, extract_kv(kv));
-
-    KV assign_copied_kv;
-    assign_copied_kv = kv;
-    ASSERT_EQ(data, extract_kv(assign_copied_kv));
 
     KV assign_moved_kv;
     assign_moved_kv = std::move(kv);
@@ -221,7 +227,7 @@ TEST(FlatHashMap, remove_if_basic) {
   constexpr int TESTS_N = 1000;
   constexpr int MAX_TABLE_SIZE = 1000;
   for (int test_i = 0; test_i < TESTS_N; test_i++) {
-    std::unordered_map<td::uint64, td::uint64> reference;
+    std::unordered_map<td::uint64, td::uint64, td::Hash<td::uint64>> reference;
     td::FlatHashMap<td::uint64, td::uint64> table;
     int N = rnd.fast(1, MAX_TABLE_SIZE);
     for (int i = 0; i < N; i++) {
@@ -249,7 +255,7 @@ static constexpr size_t MAX_TABLE_SIZE = 1000;
 TEST(FlatHashMap, stress_test) {
   td::Random::Xorshift128plus rnd(123);
   size_t max_table_size = MAX_TABLE_SIZE;  // dynamic value
-  std::unordered_map<td::uint64, td::uint64> ref;
+  std::unordered_map<td::uint64, td::uint64, td::Hash<td::uint64>> ref;
   td::FlatHashMap<td::uint64, td::uint64> tbl;
 
   auto validate = [&] {
@@ -265,8 +271,7 @@ TEST(FlatHashMap, stress_test) {
 
   td::vector<td::RandomSteps::Step> steps;
   auto add_step = [&](td::Slice step_name, td::uint32 weight, auto f) {
-    auto g = [&, step_name, f = std::move(f)] {
-      //LOG(ERROR) << step_name;
+    auto g = [&, f = std::move(f)] {
       //ASSERT_EQ(ref.size(), tbl.size());
       f();
       ASSERT_EQ(ref.size(), tbl.size());
@@ -324,7 +329,7 @@ TEST(FlatHashMap, stress_test) {
     ASSERT_EQ(ref[key], tbl[key]);
   });
 
-  add_step("reserve", 10, [&] { tbl.reserve(rnd() % max_table_size); });
+  add_step("reserve", 10, [&] { tbl.reserve(static_cast<size_t>(rnd() % max_table_size)); });
 
   add_step("find", 1000, [&] {
     auto key = gen_key();
@@ -372,7 +377,7 @@ TEST(FlatHashSet, stress_test) {
 
   td::Random::Xorshift128plus rnd(123);
   size_t max_table_size = MAX_TABLE_SIZE;  // dynamic value
-  std::unordered_set<td::uint64> ref;
+  std::unordered_set<td::uint64, td::Hash<td::uint64>> ref;
   td::FlatHashSet<td::uint64> tbl;
 
   auto validate = [&] {
@@ -407,7 +412,7 @@ TEST(FlatHashSet, stress_test) {
     tbl.insert(key);
   });
 
-  add_step("reserve", 10, [&] { tbl.reserve(rnd() % max_table_size); });
+  add_step("reserve", 10, [&] { tbl.reserve(static_cast<size_t>(rnd() % max_table_size)); });
 
   add_step("find", 1000, [&] {
     auto key = gen_key();

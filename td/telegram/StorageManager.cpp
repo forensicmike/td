@@ -1,12 +1,11 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/StorageManager.h"
 
-#include "td/telegram/ConfigShared.h"
 #include "td/telegram/DialogId.h"
 #include "td/telegram/files/FileGcWorker.h"
 #include "td/telegram/files/FileStatsWorker.h"
@@ -14,7 +13,6 @@
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/MessagesManager.h"
 #include "td/telegram/TdDb.h"
-#include "td/telegram/TdParameters.h"
 
 #include "td/db/SqliteDb.h"
 
@@ -188,7 +186,7 @@ int64 StorageManager::get_database_size() {
 
 int64 StorageManager::get_language_pack_database_size() {
   int64 size = 0;
-  auto path = G()->shared_config().get_option_string("language_pack_database_path");
+  auto path = G()->get_option_string("language_pack_database_path");
   if (!path.empty()) {
     SqliteDb::with_db_path(path, [&size](CSlice path) { size += get_file_size(path); });
   }
@@ -262,9 +260,14 @@ void StorageManager::send_stats(FileStats &&stats, int32 dialog_limit, std::vect
   auto promise = PromiseCreator::lambda(
       [promises = std::move(promises), stats = std::move(stats)](vector<DialogId> dialog_ids) mutable {
         stats.apply_dialog_ids(dialog_ids);
-        for (auto &promise : promises) {
-          promise.set_value(FileStats(stats));
+        auto size = promises.size();
+        size--;
+        for (size_t i = 0; i < size; i++) {
+          if (promises[i]) {
+            promises[i].set_value(FileStats(stats));
+          }
         }
+        promises[size].set_value(std::move(stats));
       });
 
   send_closure(G()->messages_manager(), &MessagesManager::load_dialogs, std::move(dialog_ids), std::move(promise));
@@ -317,8 +320,7 @@ void StorageManager::save_last_gc_timestamp() {
 }
 
 void StorageManager::schedule_next_gc() {
-  if (!G()->shared_config().get_option_boolean("use_storage_optimizer") &&
-      !G()->parameters().enable_storage_optimizer) {
+  if (!G()->get_option_boolean("use_storage_optimizer")) {
     next_gc_at_ = 0;
     cancel_timeout();
     LOG(INFO) << "No next file clean up is scheduled";

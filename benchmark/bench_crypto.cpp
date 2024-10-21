@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2022
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -51,6 +51,106 @@ class SHA1Bench final : public td::Benchmark {
   }
 };
 #endif
+
+class SHA1ShortBench final : public td::Benchmark {
+ public:
+  alignas(64) unsigned char data[SHORT_DATA_SIZE];
+
+  std::string get_description() const final {
+    return PSTRING() << "SHA1 [" << SHORT_DATA_SIZE << "B]";
+  }
+
+  void start_up() final {
+    std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
+  }
+
+  void run(int n) final {
+    unsigned char md[20];
+    for (int i = 0; i < n; i++) {
+      td::sha1(td::Slice(data, SHORT_DATA_SIZE), md);
+    }
+  }
+};
+
+class SHA256ShortBench final : public td::Benchmark {
+ public:
+  alignas(64) unsigned char data[SHORT_DATA_SIZE];
+
+  std::string get_description() const final {
+    return PSTRING() << "SHA256 [" << SHORT_DATA_SIZE << "B]";
+  }
+
+  void start_up() final {
+    std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
+  }
+
+  void run(int n) final {
+    unsigned char md[32];
+    for (int i = 0; i < n; i++) {
+      td::sha256(td::Slice(data, SHORT_DATA_SIZE), td::MutableSlice(md, 32));
+    }
+  }
+};
+
+class SHA512ShortBench final : public td::Benchmark {
+ public:
+  alignas(64) unsigned char data[SHORT_DATA_SIZE];
+
+  std::string get_description() const final {
+    return PSTRING() << "SHA512 [" << SHORT_DATA_SIZE << "B]";
+  }
+
+  void start_up() final {
+    std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
+  }
+
+  void run(int n) final {
+    unsigned char md[64];
+    for (int i = 0; i < n; i++) {
+      td::sha512(td::Slice(data, SHORT_DATA_SIZE), td::MutableSlice(md, 64));
+    }
+  }
+};
+
+class HmacSha256ShortBench final : public td::Benchmark {
+ public:
+  alignas(64) unsigned char data[SHORT_DATA_SIZE];
+
+  std::string get_description() const final {
+    return PSTRING() << "HMAC-SHA256 [" << SHORT_DATA_SIZE << "B]";
+  }
+
+  void start_up() final {
+    std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
+  }
+
+  void run(int n) final {
+    unsigned char md[32];
+    for (int i = 0; i < n; i++) {
+      td::hmac_sha256(td::Slice(data, SHORT_DATA_SIZE), td::Slice(data, SHORT_DATA_SIZE), td::MutableSlice(md, 32));
+    }
+  }
+};
+
+class HmacSha512ShortBench final : public td::Benchmark {
+ public:
+  alignas(64) unsigned char data[SHORT_DATA_SIZE];
+
+  std::string get_description() const final {
+    return PSTRING() << "HMAC-SHA512 [" << SHORT_DATA_SIZE << "B]";
+  }
+
+  void start_up() final {
+    std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
+  }
+
+  void run(int n) final {
+    unsigned char md[32];
+    for (int i = 0; i < n; i++) {
+      td::hmac_sha256(td::Slice(data, SHORT_DATA_SIZE), td::Slice(data, SHORT_DATA_SIZE), td::MutableSlice(md, 32));
+    }
+  }
+};
 
 class AesEcbBench final : public td::Benchmark {
  public:
@@ -206,14 +306,14 @@ class AesCbcDecryptBench final : public td::Benchmark {
 
   void start_up() final {
     std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
-    td::Random::secure_bytes(as_slice(key));
-    td::Random::secure_bytes(as_slice(iv));
+    td::Random::secure_bytes(as_mutable_slice(key));
+    td::Random::secure_bytes(as_mutable_slice(iv));
   }
 
   void run(int n) final {
     td::MutableSlice data_slice(data, DATA_SIZE);
     for (int i = 0; i < n; i++) {
-      td::aes_cbc_decrypt(as_slice(key), as_slice(iv), data_slice, data_slice);
+      td::aes_cbc_decrypt(as_slice(key), as_mutable_slice(iv), data_slice, data_slice);
     }
   }
 };
@@ -230,14 +330,14 @@ class AesCbcEncryptBench final : public td::Benchmark {
 
   void start_up() final {
     std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
-    td::Random::secure_bytes(as_slice(key));
-    td::Random::secure_bytes(as_slice(iv));
+    td::Random::secure_bytes(as_mutable_slice(key));
+    td::Random::secure_bytes(as_mutable_slice(iv));
   }
 
   void run(int n) final {
     td::MutableSlice data_slice(data, DATA_SIZE);
     for (int i = 0; i < n; i++) {
-      td::aes_cbc_encrypt(as_slice(key), as_slice(iv), data_slice, data_slice);
+      td::aes_cbc_encrypt(as_slice(key), as_mutable_slice(iv), data_slice, data_slice);
     }
   }
 };
@@ -255,8 +355,8 @@ class AesIgeShortBench final : public td::Benchmark {
 
   void start_up() final {
     std::fill(std::begin(data), std::end(data), static_cast<unsigned char>(123));
-    td::Random::secure_bytes(as_slice(key));
-    td::Random::secure_bytes(as_slice(iv));
+    td::Random::secure_bytes(as_mutable_slice(key));
+    td::Random::secure_bytes(as_mutable_slice(iv));
   }
 
   void run(int n) final {
@@ -267,7 +367,7 @@ class AesIgeShortBench final : public td::Benchmark {
         ige.init(as_slice(key), as_slice(iv), false);
         ige.decrypt(data_slice, data_slice);
       } else {
-        td::aes_ige_decrypt(as_slice(key), as_slice(iv), data_slice, data_slice);
+        td::aes_ige_decrypt(as_slice(key), as_mutable_slice(iv), data_slice, data_slice);
       }
     }
   }
@@ -351,7 +451,7 @@ class Crc32Bench final : public td::Benchmark {
   alignas(64) unsigned char data[DATA_SIZE];
 
   std::string get_description() const final {
-    return PSTRING() << "Crc32 zlib [" << (DATA_SIZE >> 10) << "KB]";
+    return PSTRING() << "CRC32 zlib [" << (DATA_SIZE >> 10) << "KB]";
   }
 
   void start_up() final {
@@ -372,7 +472,7 @@ class Crc64Bench final : public td::Benchmark {
   alignas(64) unsigned char data[DATA_SIZE];
 
   std::string get_description() const final {
-    return PSTRING() << "Crc64 Anton [" << (DATA_SIZE >> 10) << "KB]";
+    return PSTRING() << "CRC64 Anton [" << (DATA_SIZE >> 10) << "KB]";
   }
 
   void start_up() final {
@@ -415,6 +515,11 @@ int main() {
 #if OPENSSL_VERSION_NUMBER <= 0x10100000L
   td::bench(SHA1Bench());
 #endif
+  td::bench(SHA1ShortBench());
+  td::bench(SHA256ShortBench());
+  td::bench(SHA512ShortBench());
+  td::bench(HmacSha256ShortBench());
+  td::bench(HmacSha512ShortBench());
   td::bench(Crc32Bench());
   td::bench(Crc64Bench());
 }
